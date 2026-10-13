@@ -492,7 +492,7 @@ class TwitchChatWorker(QObject):
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Achievement Manager v0.8 Beta (Stage 7 開発版)')
+        self.setWindowTitle('Achievement Manager v0.8 Beta (Stage 8 開発版)')
         self.toasts=[]
         self.toast_queue=[]
         self.toast_busy=False
@@ -1075,6 +1075,30 @@ class App(QMainWindow):
         card_rows.extend((title,'★'*rank+'☆'*(5-rank),'解除済み' if done else '未解除',progress,at or '-') for title,rank,done,progress,at in custom)
         card_rows=sort_achievements(card_rows, self.card_rank_order.currentData(), rank_index=1)
         self.fill(self.card_table,card_rows)
+        self.highlight_unlocked_card_rows(card_rows)
+
+    def highlight_unlocked_card_rows(self, card_rows):
+        # Highlight by the unlocked state, not the row index: sorting is safe.
+        # This changes presentation only; progress and SQLite data are untouched.
+        unlocked_background = QColor('#183F48')
+        unlocked_text = QColor('#E4FFF5')
+        unlocked_status = QColor('#6CE0AE')
+        for row_index, row in enumerate(card_rows):
+            is_unlocked = row[2] == '解除済み'
+            for column_index in range(self.card_table.columnCount()):
+                item = self.card_table.item(row_index, column_index)
+                if item is None:
+                    continue
+                if is_unlocked:
+                    item.setBackground(unlocked_background)
+                    if column_index != 1:  # Keep the existing star-rank color.
+                        item.setForeground(unlocked_status if column_index == 2 else unlocked_text)
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setToolTip('解除済みの実績')
+                else:
+                    item.setToolTip('未解除の実績')
 
     def backup(self):
         dst=BASE / ('achievements_backup_'+datetime.now().strftime('%Y%m%d_%H%M%S')+'.db')

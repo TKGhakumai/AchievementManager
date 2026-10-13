@@ -1,8 +1,9 @@
 #define MyAppName "Achievement Manager"
-#define MyAppVersion "0.7.0-beta.2"
+#define MyAppVersion "0.8.0-beta.1"
 #define MyAppPublisher "Achievement Manager Contributors"
 #define MyAppExeName "AchievementManager.exe"
 [Setup]
+; Keep the same AppId as v0.7 for in-place upgrades.
 AppId={{D9C29A73-4777-4A0D-B823-1D62D3D08F46}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
@@ -11,7 +12,7 @@ DefaultDirName={localappdata}\Programs\AchievementManager
 DefaultGroupName={#MyAppName}
 PrivilegesRequired=lowest
 OutputDir=..\dist-installer
-OutputBaseFilename=AchievementManager-Setup-v0.7.0-beta.2
+OutputBaseFilename=AchievementManager-Setup-v0.8.0-beta.1
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
