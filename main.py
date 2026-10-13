@@ -260,6 +260,8 @@ BRIDGE_CLIENT_ID = None
 BRIDGE_TOKEN_LOCK = threading.Lock()
 BRIDGE_EVENT_IDS = set()
 BRIDGE_EVENT_LOCK = threading.Lock()
+BRIDGE_ENABLED = False  # Explicitly enabled only by the streamer
+BRIDGE_PROTOCOL_VERSION = 1
 
 class BridgeEmitter(QObject):
     received = pyqtSignal(str, str, str)
@@ -281,9 +283,19 @@ def resolve_twitch_user(login):
         return None
 
 class BridgeHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != '/api/status':
+            self.send_error(404); return
+        if self.headers.get('X-Achievement-Key') != BRIDGE_KEY:
+            self.reply(403, {'error':'unauthorized'}); return
+        self.reply(200, {'app':'AchievementManager', 'protocol_version':BRIDGE_PROTOCOL_VERSION,
+                         'connected':BRIDGE_ENABLED, 'supported_events':sorted(BRIDGE_ALLOWED)})
+
     def do_POST(self):
         if self.path != '/api/event':
             self.send_error(404); return
+        if not BRIDGE_ENABLED:
+            self.reply(503, {'error':'TKG connection is disabled'}); return
         if self.headers.get('X-Achievement-Key') != BRIDGE_KEY:
             self.send_error(403); return
         try:
@@ -480,7 +492,7 @@ class TwitchChatWorker(QObject):
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Achievement Manager v0.8 Beta (Stage 6 開発版)')
+        self.setWindowTitle('Achievement Manager v0.8 Beta (Stage 7 開発版)')
         self.toasts=[]
         self.toast_queue=[]
         self.toast_busy=False
@@ -511,7 +523,7 @@ class App(QMainWindow):
         self.apply_theme()
         self.refresh_all()
         self.start_obs_server()
-        self.start_bridge_server()
+        # TKG bridge stays OFF until the user explicitly enables it.
 
     def make_v08_editor(self):
         # Separate database: v0.7 achievements and progress are not modified.
@@ -614,8 +626,21 @@ class App(QMainWindow):
         w,l=self.page()
         group=QGroupBox('接続状況'); f=QFormLayout(group)
         self.twitch_status=QLabel('未接続'); f.addRow('Twitch',self.twitch_status)
-        self.bridge_status=QLabel('起動準備中')
+        self.bridge_status=QLabel('未接続（手動接続）')
         f.addRow('演出アプリ',self.bridge_status)
+        bridge_controls=QHBoxLayout()
+        self.bridge_connect_button=QPushButton('TKG接続')
+        self.bridge_connect_button.clicked.connect(self.start_bridge_server)
+        self.bridge_disconnect_button=QPushButton('TKG切断')
+        self.bridge_disconnect_button.clicked.connect(self.stop_bridge_server)
+        self.bridge_disconnect_button.setEnabled(False)
+        bridge_controls.addWidget(self.bridge_connect_button)
+        bridge_controls.addWidget(self.bridge_disconnect_button)
+        f.addRow(bridge_controls)
+        bridge_help=QLabel('任意連携：TKGは同梱しません。接続時のみローカル127.0.0.1:8767で待機します。\n'
+                           '連携側は既存の /api/event と認証キーに対応する必要があります。')
+        bridge_help.setWordWrap(True)
+        f.addRow(bridge_help)
         f.addRow('OBS通知', QLabel('http://127.0.0.1:8766/'))
         self.twitch_channel=QLineEdit(); self.twitch_channel.setPlaceholderText('配信チャンネル名（英数字）')
         self.twitch_channel.setText(str(self.prefs.value('twitch_channel','')))
@@ -809,14 +834,37 @@ class App(QMainWindow):
             self.obs_url.setText('OBS通知サーバー起動失敗: '+str(exc))
 
     def start_bridge_server(self):
-        global BRIDGE_SIGNAL
-        BRIDGE_SIGNAL=self.bridge_emitter
+        global BRIDGE_SIGNAL, BRIDGE_ENABLED
+        if self.bridge_server is not None:
+            return
         try:
-            self.bridge_server=ThreadingHTTPServer(('127.0.0.1',8767),BridgeHandler)
-            threading.Thread(target=self.bridge_server.serve_forever,daemon=True).start()
-            self.bridge_status.setText('イベント受信待機中：127.0.0.1:8767')
+            server=ThreadingHTTPServer(('127.0.0.1',8767),BridgeHandler)
+            BRIDGE_SIGNAL=self.bridge_emitter
+            BRIDGE_ENABLED=True
+            self.bridge_server=server
+            threading.Thread(target=server.serve_forever,daemon=True).start()
+            self.bridge_status.setText('TKG接続：待機中（127.0.0.1:8767）')
+            self.bridge_connect_button.setEnabled(False)
+            self.bridge_disconnect_button.setEnabled(True)
         except OSError as exc:
-            self.bridge_status.setText('起動失敗：'+str(exc))
+            BRIDGE_ENABLED=False
+            BRIDGE_SIGNAL=None
+            self.bridge_status.setText('接続失敗：'+str(exc))
+
+    def stop_bridge_server(self):
+        global BRIDGE_SIGNAL, BRIDGE_ENABLED
+        BRIDGE_ENABLED=False
+        BRIDGE_SIGNAL=None
+        server=self.bridge_server
+        self.bridge_server=None
+        if server:
+            server.shutdown()
+            server.server_close()
+        with BRIDGE_EVENT_LOCK:
+            BRIDGE_EVENT_IDS.clear()
+        self.bridge_status.setText('未接続（手動接続）')
+        self.bridge_connect_button.setEnabled(True)
+        self.bridge_disconnect_button.setEnabled(False)
 
     def on_bridge_event(self,user_id,name,event_type):
         try:
@@ -867,9 +915,7 @@ class App(QMainWindow):
         if self.http_server:
             self.http_server.shutdown()
             self.http_server.server_close()
-        if self.bridge_server:
-            self.bridge_server.shutdown()
-            self.bridge_server.server_close()
+        self.stop_bridge_server()
         super().closeEvent(event)
 
     def connect_twitch(self):
@@ -1047,9 +1093,7 @@ class App(QMainWindow):
             self.http_server.shutdown()
             self.http_server.server_close()
             self.http_server=None
-        self.bridge_server=None
-        self.bridge_emitter=BridgeEmitter()
-        self.bridge_emitter.received.connect(self.on_bridge_event)
+        self.stop_bridge_server()
         import subprocess
         try:
             if getattr(sys,'frozen',False):
