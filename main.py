@@ -480,7 +480,7 @@ class TwitchChatWorker(QObject):
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Achievement Manager v0.8 Beta (Stage 5 開発版)')
+        self.setWindowTitle('Achievement Manager v0.8 Beta (Stage 6 開発版)')
         self.toasts=[]
         self.toast_queue=[]
         self.toast_busy=False
@@ -553,7 +553,16 @@ class App(QMainWindow):
         btn=QPushButton('テストイベントを送信'); btn.clicked.connect(self.test_event)
         g.addRow('TwitchユーザーID（テスト用）',self.test_id)
         g.addRow('表示名',self.test_name); g.addRow('イベント',self.event_select); g.addRow(btn)
+        self.test_chat_text=QLineEdit()
+        self.test_chat_text.setPlaceholderText('例：こんにちは www （チャット受信と同じ判定をテスト）')
+        chat_btn=QPushButton('チャット本文でテスト')
+        chat_btn.clicked.connect(self.test_chat_message)
+        g.addRow('チャット本文',self.test_chat_text)
+        g.addRow(chat_btn)
         l.addWidget(group)
+        self.event_feedback=QLabel('テストイベントの記録待ち')
+        self.event_feedback.setWordWrap(True)
+        l.addWidget(self.event_feedback)
         l.addWidget(QLabel('最近の実績解除'))
         self.recent=self.table(['日時','視聴者','実績']); l.addWidget(self.recent)
         self.tabs.addTab(w,'ダッシュボード')
@@ -582,7 +591,18 @@ class App(QMainWindow):
         self.card_name=QLabel('視聴者を選択してください'); self.card_name.setStyleSheet('font-size:19pt;font-weight:bold;')
         l.addWidget(self.card_name)
         self.card_progress=QProgressBar(); l.addWidget(self.card_progress)
+        rank_bar=QHBoxLayout()
+        rank_bar.addWidget(QLabel('★ ランク順'))
+        self.card_rank_order=QComboBox()
+        self.card_rank_order.addItem('昇順（★1 → ★5）','asc')
+        self.card_rank_order.addItem('降順（★5 → ★1）','desc')
+        self.card_rank_order.currentIndexChanged.connect(self.refresh_card)
+        rank_bar.addWidget(self.card_rank_order)
+        rank_bar.addStretch()
+        l.addLayout(rank_bar)
         self.card_table=self.table(['実績','ランク','状態','進捗','解除日時'])
+        self.card_table.horizontalHeader().sectionClicked.connect(
+            lambda column: self._toggle_rank_order(self.card_rank_order) if column==1 else None)
         l.addWidget(self.card_table)
         self.tabs.addTab(w,'個人実績カード')
 
@@ -806,7 +826,7 @@ class App(QMainWindow):
                 unlocked=record_event(user_id,name,event_type[0],event_type[1]) if isinstance(event_type,tuple) else record_event(user_id,name,event_type)
             if unlocked: self.queue_unlocks(unlocked,name)
             self.refresh_all()
-            self.bridge_status.setText('イベント受信：'+event_type+' / '+name)
+            self.bridge_status.setText('イベント受信：'+str(event_type)+' / '+name)
         except Exception as exc:
             self.bridge_status.setText('記録エラー：'+str(exc))
 
@@ -917,10 +937,35 @@ class App(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self,'入力エラー',str(exc)); return
         self.refresh_all()
+        self.event_feedback.setText(
+            ('解除成功：'+'、'.join(unlocked)) if unlocked else 'イベントを記録しました（新しい解除なし）')
         if unlocked:
             self.queue_unlocks(unlocked,self.test_name.text())
         else:
             QMessageBox.information(self,'イベント受信','進捗を記録しました。未解除の新しい実績はありません。')
+
+    def test_chat_message(self):
+        message=self.test_chat_text.text()
+        if not message.strip():
+            QMessageBox.warning(self,'入力エラー','テスト用のチャット本文を入力してください。')
+            return
+        try:
+            unlocked=[]
+            for ev in parse_chat_events(message, '', self.twitch_worker.target_emote_name):
+                if isinstance(ev,tuple) and ev[0]=='chat.keyword_message':
+                    unlocked.extend(record_event(self.test_id.text(),self.test_name.text(),
+                        'chat.keyword_message',keyword_message=ev[1]))
+                elif isinstance(ev,tuple):
+                    unlocked.extend(record_event(self.test_id.text(),self.test_name.text(),ev[0],ev[1]))
+                else:
+                    unlocked.extend(record_event(self.test_id.text(),self.test_name.text(),ev))
+        except (ValueError,sqlite3.Error) as exc:
+            QMessageBox.warning(self,'テストエラー',str(exc))
+            return
+        self.refresh_all()
+        self.event_feedback.setText('チャット解析テスト：'+
+            ('解除 '+ '、'.join(unlocked) if unlocked else '記録成功・新しい解除なし'))
+        if unlocked:self.queue_unlocks(unlocked,self.test_name.text())
 
     def refresh_all(self):
         with connect() as db:
@@ -928,9 +973,12 @@ class App(QMainWindow):
             unlocks=db.execute("SELECT COUNT(*) FROM progress WHERE unlocked_at IS NOT NULL AND achievement_id LIKE 'v06_%'").fetchone()[0]
             unlocks+=db.execute('SELECT COUNT(*) FROM v08_progress').fetchone()[0]
             self.stats.setText(f'登録視聴者  {users} 人      累計実績解除  {unlocks} 件')
-            rows=db.execute('''SELECT e.occurred_at,u.display_name,a.title FROM event_log e
-                JOIN users u ON e.user_id=u.user_id JOIN achievements a ON e.achievement_id=a.achievement_id
-                WHERE a.achievement_id LIKE 'v06_%'
+            rows=db.execute('''SELECT e.occurred_at,u.display_name,
+                    COALESCE(a.title,d.title,'（削除済み実績）')
+                FROM event_log e
+                JOIN users u ON e.user_id=u.user_id
+                LEFT JOIN achievements a ON e.achievement_id=a.achievement_id
+                LEFT JOIN v08_achievement_definitions d ON e.achievement_id=d.id
                 ORDER BY e.id DESC LIMIT 50''').fetchall()
             self.fill(self.recent,rows)
             rows=db.execute("SELECT title,rank,description,target,event_type FROM achievements WHERE achievement_id LIKE 'v06_%' ORDER BY rank,achievement_id").fetchall()
@@ -979,7 +1027,7 @@ class App(QMainWindow):
         self.card_progress.setValue(round(done*100/total) if total else 0)
         card_rows=[(title,'★'*rank+'☆'*(5-rank),'解除済み' if at else '未解除',f'{min(count,target)} / {target}',at or '-') for title,rank,count,target,at in rows]
         card_rows.extend((title,'★'*rank+'☆'*(5-rank),'解除済み' if done else '未解除',progress,at or '-') for title,rank,done,progress,at in custom)
-        card_rows = sort_achievements(card_rows,self.card_rank_order.currentData()if hasattr(self, "card_rank_order")else "asc",rank_index=1)
+        card_rows=sort_achievements(card_rows, self.card_rank_order.currentData(), rank_index=1)
         self.fill(self.card_table,card_rows)
 
     def backup(self):
