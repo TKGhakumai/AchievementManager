@@ -92,11 +92,13 @@ TKG_LEGACY_IDS = frozenset({
 GENERIC_ACHIEVEMENTS = tuple(a for a in ACHIEVEMENTS if a[0] not in TKG_LEGACY_IDS)
 
 def visible_legacy_achievements():
-    return ACHIEVEMENTS if BRIDGE_ENABLED else GENERIC_ACHIEVEMENTS
+    return [a for a in (ACHIEVEMENTS if BRIDGE_ENABLED else GENERIC_ACHIEVEMENTS)
+            if a[0] not in V08_STORE.deleted_ids()]
 
 def visible_v08_definitions(enabled_only=False):
     return [d for d in v08_definitions(enabled_only)
-            if BRIDGE_ENABLED or d['source'] != 'tkg_template']
+            if (BRIDGE_ENABLED or d['source'] != 'tkg_template')
+            and d['id'] not in V08_STORE.deleted_ids()]
 
 ACTIVE_IDS = tuple(a[0] for a in ACHIEVEMENTS)
 FIVE_EFFECTS = ('effect.passing','effect.meteor','effect.flash','effect.glass','effect.smoke')
@@ -141,9 +143,7 @@ def init_db():
         ''')
         for a in ACHIEVEMENTS:
             db.execute('''INSERT INTO achievements(achievement_id,title,description,rank,event_type,target)
-                VALUES(?,?,?,?,?,?) ON CONFLICT(achievement_id) DO UPDATE SET
-                title=excluded.title,description=excluded.description,rank=excluded.rank,
-                event_type=excluded.event_type,target=excluded.target''',a)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(achievement_id) DO NOTHING''',a)
 
     V08_STORE.initialize()
     # Import existing Stage 3 drafts once, preserving their stable IDs.
@@ -229,7 +229,10 @@ def record_event(user_id, name, event_type, amount=1, keyword_message=None):
                 # set once; combination progress is a boolean condition.
                 db.execute('''INSERT INTO event_counters(user_id,event_type,count) VALUES(?,?,1)
                     ON CONFLICT(user_id,event_type) DO UPDATE SET count=1''',(user_id,'combo.hack'))
-        for aid,title,_,rank,kind,target in visible_legacy_achievements():
+        allowed={a[0] for a in visible_legacy_achievements()}
+        for aid,title,rank,kind,target in db.execute(
+                'SELECT achievement_id,title,rank,event_type,target FROM achievements'):
+            if aid not in allowed: continue
             row=db.execute('SELECT count FROM event_counters WHERE user_id=? AND event_type=?',(user_id,kind)).fetchone()
             count=row[0] if row else 0
             old=db.execute('SELECT unlocked_at FROM progress WHERE user_id=? AND achievement_id=?',(user_id,aid)).fetchone()
@@ -525,7 +528,7 @@ class TwitchChatWorker(QObject):
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Achievement Manager v0.8 Beta (公開候補)')
+        self.setWindowTitle('Achievement Manager v0.8 Beta')
         self.toasts=[]
         self.toast_queue=[]
         self.toast_busy=False
@@ -564,7 +567,7 @@ class App(QMainWindow):
 
     def make_v08_editor(self):
         # Separate database: v0.7 achievements and progress are not modified.
-        self.v08_editor = AchievementEditor(DB_PATH)
+        self.v08_editor = AchievementEditor(DB_PATH, legacy_provider=lambda: {a[0] for a in visible_legacy_achievements()})
         self.v08_editor.saved.connect(self.refresh_all)
         self.v08_editor.setWindowTitle('実績管理')
         self.tabs.addTab(self.v08_editor, '実績管理（v0.8）')
@@ -866,6 +869,7 @@ class App(QMainWindow):
             self.bridge_status.setText('TKG接続：待機中（127.0.0.1:8767）')
             self.bridge_connect_button.setEnabled(False)
             self.bridge_disconnect_button.setEnabled(True)
+            self.v08_editor.refresh()
             self.refresh_all()
         except OSError as exc:
             BRIDGE_ENABLED=False
@@ -886,6 +890,7 @@ class App(QMainWindow):
         self.bridge_status.setText('未接続（手動接続）')
         self.bridge_connect_button.setEnabled(True)
         self.bridge_disconnect_button.setEnabled(False)
+        self.v08_editor.refresh()
         self.refresh_all()
 
     def on_bridge_event(self,user_id,name,event_type):
@@ -1048,7 +1053,6 @@ class App(QMainWindow):
                 LEFT JOIN v08_achievement_definitions d ON e.achievement_id=d.id
                 ORDER BY e.id DESC LIMIT 50''').fetchall()
             self.fill(self.recent,rows)
-            rows=db.execute("SELECT title,rank,description,target,event_type FROM achievements WHERE achievement_id LIKE 'v06_%' ORDER BY rank,achievement_id").fetchall()
             visible_ids={a[0] for a in visible_legacy_achievements()}
             legacy_rows=db.execute("SELECT achievement_id,title,rank,description,target,event_type FROM achievements WHERE achievement_id LIKE 'v06_%' ORDER BY rank,achievement_id").fetchall()
             displayed=[(title,'★'*rank+'☆'*(5-rank),description,target,event_type)

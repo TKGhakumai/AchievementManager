@@ -16,16 +16,17 @@ EVENTS = [('コメント','chat.comment'),('スタンプ','chat.emote'),
 
 class Editor(QWidget):
     saved = pyqtSignal()
-    def __init__(self, database):
+    def __init__(self, database, legacy_provider=None):
         super().__init__()
         self.store = AchievementStore(database)
+        self.legacy_provider = legacy_provider
         self.store.initialize()
         self.current_id = None
         self._loading = False
         self._baseline = None
         root = QHBoxLayout(self)
         left = QVBoxLayout()
-        left.addWidget(QLabel('保存済み実績'))
+        left.addWidget(QLabel('基本実績・追加実績'))
         self.items = QListWidget()
         self.items.setMinimumWidth(185)
         self.items.setMaximumWidth(275)
@@ -86,7 +87,8 @@ class Editor(QWidget):
         self.save_button=QPushButton('新規追加'); self.save_button.clicked.connect(self.save)
         self.clear_button=QPushButton('クリア'); self.clear_button.clicked.connect(self.clear_form)
         self.disable_button=QPushButton('無効化'); self.disable_button.clicked.connect(self.disable)
-        buttons.addWidget(self.save_button); buttons.addWidget(self.clear_button); buttons.addWidget(self.disable_button)
+        self.delete_button=QPushButton('削除'); self.delete_button.clicked.connect(self.delete_item)
+        buttons.addWidget(self.save_button); buttons.addWidget(self.clear_button); buttons.addWidget(self.disable_button); buttons.addWidget(self.delete_button)
         right.addLayout(buttons); right.addStretch()
         scroll.setWidget(panel); root.addWidget(scroll,3)
         for widget,signal in [(self.title,self.title.textChanged),(self.keyword,self.keyword.textChanged),
@@ -143,7 +145,11 @@ class Editor(QWidget):
         return d
 
     def has_unsaved_changes(self):
-        return self._baseline is not None and self._snapshot()!=self._baseline
+        if self._baseline is None:return False
+        if self.current_id and self.current_id.startswith('v06_'):
+            now=self._snapshot()
+            return any(now[k]!=self._baseline[k] for k in ('title','rank')) or now['conditions'][0]['target']!=self._baseline['conditions'][0]['target']
+        return self._snapshot()!=self._baseline
 
     def _update_dirty(self,*_):
         if self._loading or self._baseline is None:return
@@ -157,6 +163,7 @@ class Editor(QWidget):
 
     def _reset_form(self):
         self._loading=True
+        self._set_legacy_mode(False)
         self.current_id=None
         self.items.blockSignals(True); self.items.setCurrentRow(-1); self.items.blockSignals(False)
         self.template.setCurrentIndex(0); self.title.setText(TEMPLATES[0][2])
@@ -167,7 +174,8 @@ class Editor(QWidget):
         self.extra_count.setValue(1); self.extra_keyword.clear()
         self._loading=False
         self._toggle_details(); self.update_keyword_state()
-        self.save_button.setText('新規追加'); self.disable_button.setEnabled(False)
+        self.save_button.setText('新規追加'); self.disable_button.setEnabled(False); self.delete_button.setEnabled(False)
+        self._set_legacy_mode(False)
         self._baseline=self._snapshot(); self._update_dirty()
 
     def new_item(self):
@@ -181,9 +189,12 @@ class Editor(QWidget):
         else:self._reset_form()
 
     def refresh(self,selected=None):
-        self.rows=self.store.list_all()
+        allowed=self.legacy_provider() if self.legacy_provider else None
+        deleted=self.store.deleted_ids()
+        self.rows=self.store.list_legacy(allowed)+[dict(d,legacy=False) for d in self.store.list_all()
+            if d['id'] not in deleted and (allowed is None or d.get('source') != 'tkg_template' or len(allowed)>9)]
         self.items.blockSignals(True); self.items.clear()
-        for item in self.rows:self.items.addItem(('' if item['enabled'] else '[無効] ')+item['title'])
+        for item in self.rows:self.items.addItem(('[基本] ' if item.get('legacy') else '[追加] ')+('' if item['enabled'] else '[無効] ')+item['title'])
         if selected:
             for i,item in enumerate(self.rows):
                 if item['id']==selected:self.items.setCurrentRow(i);break
@@ -200,19 +211,25 @@ class Editor(QWidget):
 
     def _load_item(self,data):
         self._loading=True
+        self._set_legacy_mode(bool(data.get('legacy')))
         self.current_id=data['id']
         self.items.blockSignals(True)
         idx=next((i for i,r in enumerate(self.rows) if r['id']==self.current_id),-1)
         self.items.setCurrentRow(idx); self.items.blockSignals(False)
         self.title.setText(data['title']); self.rank.setCurrentIndex(data['rank']-1)
-        self.enabled.setChecked(data['enabled']); self.operator.setCurrentText(data['operator'])
+        self.enabled.setChecked(data['enabled']); self.operator.setCurrentText(data.get('operator','AND'))
+        if data.get('legacy'):
+            self.count.setValue(data['target'])
+            self.heading.setText('基本実績を編集（条件種別は固定）')
+            self.save_button.setText('変更を保存'); self.disable_button.setEnabled(False); self.delete_button.setEnabled(True)
+            self._loading=False; self._baseline=self._snapshot(); self._update_dirty(); return
         self._set_condition(self.event,self.count,self.keyword,data['conditions'][0])
         self.template.setCurrentIndex(max(0,next((i for i,x in enumerate(TEMPLATES) if x[1]==data['conditions'][0]['event_type']),0)))
         more=len(data['conditions'])>1
         self.extra.setChecked(more); self.details.setChecked(more)
         if more:self._set_condition(self.extra_event,self.extra_count,self.extra_keyword,data['conditions'][1])
         self._loading=False; self._toggle_details(); self.update_keyword_state()
-        self.save_button.setText('変更を保存'); self.disable_button.setEnabled(data['enabled'])
+        self.save_button.setText('変更を保存'); self.disable_button.setEnabled(data['enabled']); self.delete_button.setEnabled(True)
         self._baseline=self._snapshot(); self._update_dirty()
 
     @staticmethod
@@ -223,6 +240,16 @@ class Editor(QWidget):
 
     def save(self):
         data=self._snapshot(); data['description']=''
+        if self.current_id and self.current_id.startswith('v06_'):
+            try:
+                self.store.update_legacy(self.current_id,self.title.text(),self.rank.currentData(),self.count.value())
+                identifier=self.current_id
+                self.refresh(identifier); self._load_item(next(x for x in self.rows if x['id']==identifier))
+                self.saved.emit()
+                QMessageBox.information(self,'保存完了','基本実績の変更を保存しました。')
+            except (ValidationError,KeyError,ValueError) as exc:
+                QMessageBox.warning(self,'入力エラー',str(exc))
+            return
         try:
             if self.current_id:
                 self.store.update(self.current_id,data); identifier=self.current_id
@@ -233,6 +260,28 @@ class Editor(QWidget):
             QMessageBox.information(self,'保存完了','実績を保存しました。実績一覧と個人実績カードに反映されます。')
         except (ValidationError,KeyError,ValueError) as exc:
             QMessageBox.warning(self,'入力エラー',str(exc))
+
+    def _set_legacy_mode(self,legacy):
+        self.template.setEnabled(not legacy)
+        self.event.setEnabled(not legacy)
+        self.keyword.setEnabled(not legacy)
+        self.enabled.setEnabled(not legacy)
+        self.details.setEnabled(not legacy)
+        self.note.setText('基本実績は名称・★ランク・達成回数を変更できます。特殊な判定条件は変更できません。' if legacy else
+                          '入力した変更は「新規追加」または「変更を保存」を押すまで保存されません。')
+
+    def delete_item(self):
+        if not self.current_id:return
+        if not self.confirm_discard():return
+        result=QMessageBox.question(self,'実績の削除',
+            'この実績を一覧と解除判定から削除しますか？\n既存の進捗と解除履歴は保護されます。\nこの操作は画面から元に戻せません。',
+            QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
+        if result!=QMessageBox.Yes:return
+        try:
+            self.store.soft_delete(self.current_id)
+            self.refresh(); self._reset_form(); self.saved.emit()
+        except (KeyError,ValueError) as exc:
+            QMessageBox.warning(self,'削除エラー',str(exc))
 
     def disable(self):
         if not self.current_id:return

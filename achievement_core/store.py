@@ -80,6 +80,9 @@ class AchievementStore:
 
     def initialize(self):
         with self._connect() as db:
+            db.execute('''CREATE TABLE IF NOT EXISTS deleted_achievements (
+                achievement_id TEXT PRIMARY KEY, deleted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )''')
             db.execute('''CREATE TABLE IF NOT EXISTS v08_achievement_definitions (
                 id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL,
                 rank INTEGER NOT NULL CHECK(rank BETWEEN 1 AND 5),
@@ -137,3 +140,38 @@ class AchievementStore:
             cur = db.execute('UPDATE v08_achievement_definitions SET enabled=0,updated_at=CURRENT_TIMESTAMP WHERE id=?', (identifier,))
             if cur.rowcount == 0:
                 raise KeyError(identifier)
+
+    def deleted_ids(self):
+        with self._connect() as db:
+            return {r[0] for r in db.execute('SELECT achievement_id FROM deleted_achievements')}
+
+    def soft_delete(self, identifier):
+        # Keep definitions, progress, and unlock logs; only remove from active use.
+        with self._connect() as db:
+            if identifier.startswith('v08_'):
+                found=db.execute('SELECT 1 FROM v08_achievement_definitions WHERE id=?',(identifier,)).fetchone()
+            else:
+                found=db.execute('SELECT 1 FROM achievements WHERE achievement_id=?',(identifier,)).fetchone()
+            if not found: raise KeyError(identifier)
+            db.execute('INSERT OR IGNORE INTO deleted_achievements(achievement_id) VALUES(?)',(identifier,))
+
+    def list_legacy(self, allowed_ids=None):
+        with self._connect() as db:
+            rows=db.execute('SELECT achievement_id,title,description,rank,event_type,target FROM achievements ORDER BY rank,title').fetchall()
+        allowed=set(allowed_ids) if allowed_ids is not None else None
+        deleted=self.deleted_ids()
+        return [dict(id=r['achievement_id'],title=r['title'],description=r['description'],rank=r['rank'],
+                     event_type=r['event_type'],target=r['target'],enabled=True,legacy=True)
+                for r in rows if r['achievement_id'] not in deleted and (allowed is None or r['achievement_id'] in allowed)]
+
+    def update_legacy(self, identifier, title, rank, target):
+        if not isinstance(title,str) or not 1 <= len(title.strip()) <= 80:
+            raise ValidationError('実績名は1〜80文字で入力してください')
+        if type(rank) is not int or not 1 <= rank <= 5:
+            raise ValidationError('ランクは1〜5です')
+        if type(target) is not int or not 1 <= target <= 10000:
+            raise ValidationError('達成回数は1〜10000です')
+        with self._connect() as db:
+            cur=db.execute('UPDATE achievements SET title=?,rank=?,target=? WHERE achievement_id=?',
+                           (title.strip(),rank,target,identifier))
+            if not cur.rowcount: raise KeyError(identifier)
