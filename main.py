@@ -979,7 +979,7 @@ class App(QMainWindow):
         self.card_progress.setValue(round(done*100/total) if total else 0)
         card_rows=[(title,'★'*rank+'☆'*(5-rank),'解除済み' if at else '未解除',f'{min(count,target)} / {target}',at or '-') for title,rank,count,target,at in rows]
         card_rows.extend((title,'★'*rank+'☆'*(5-rank),'解除済み' if done else '未解除',progress,at or '-') for title,rank,done,progress,at in custom)
-        card_rows=sort_achievements(card_rows, self.card_rank_order.currentData(), rank_index=1)
+        card_rows = sort_achievements(card_rows,self.card_rank_order.currentData()if hasattr(self, "card_rank_order")else "asc",rank_index=1)
         self.fill(self.card_table,card_rows)
 
     def backup(self):
