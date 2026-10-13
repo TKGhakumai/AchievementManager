@@ -2,6 +2,9 @@ name: Windows beta build
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   build:
