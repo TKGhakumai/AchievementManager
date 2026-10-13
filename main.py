@@ -83,6 +83,21 @@ ACHIEVEMENTS = [
  ('v06_pass_fireworks_1','たーまやー！','通ります花火レア初当選',4,'passing.fireworks',1),
  ('v06_pass_fireworks_5','幸運すぎて怖い','通ります花火レア累計5回',5,'passing.fireworks',5),
 ]
+# Legacy TKG-specific achievements remain in SQLite for historical compatibility.
+# They are hidden unless the streamer explicitly enables the optional TKG bridge.
+TKG_LEGACY_IDS = frozenset({
+    'v06_tkg', 'v06_badgame', 'v06_gg',
+    *(a[0] for a in ACHIEVEMENTS if a[4].startswith(('effect.', 'hacking.', 'passing.', 'combo.')))
+})
+GENERIC_ACHIEVEMENTS = tuple(a for a in ACHIEVEMENTS if a[0] not in TKG_LEGACY_IDS)
+
+def visible_legacy_achievements():
+    return ACHIEVEMENTS if BRIDGE_ENABLED else GENERIC_ACHIEVEMENTS
+
+def visible_v08_definitions(enabled_only=False):
+    return [d for d in v08_definitions(enabled_only)
+            if BRIDGE_ENABLED or d['source'] != 'tkg_template']
+
 ACTIVE_IDS = tuple(a[0] for a in ACHIEVEMENTS)
 FIVE_EFFECTS = ('effect.passing','effect.meteor','effect.flash','effect.glass','effect.smoke')
 BRIDGE_ALLOWED = set(FIVE_EFFECTS) | {'effect.used','hacking.used','hacking.giant','hacking.swarm','passing.giant','passing.fireworks'}
@@ -177,12 +192,12 @@ def v08_status(db,uid,definition):
 def v08_record(db,uid,keyword_message=None):
     if keyword_message is not None:
         normalized=unicodedata.normalize('NFKC',keyword_message).casefold()
-        keywords={c['keyword'] for d in v08_definitions(True) for c in d['conditions'] if c['event_type']=='chat.keyword'}
+        keywords={c['keyword'] for d in visible_v08_definitions(True) for c in d['conditions'] if c['event_type']=='chat.keyword'}
         for word in keywords:
             if unicodedata.normalize('NFKC',word).casefold() in normalized:
                 increment(db,uid,'chat.keyword:'+unicodedata.normalize('NFKC',word).casefold())
     unlocked=[]
-    for d in v08_definitions(True):
+    for d in visible_v08_definitions(True):
         achieved,_,_,_=v08_status(db,uid,d)
         if not achieved:continue
         at=datetime.now().astimezone().isoformat(timespec='seconds')
@@ -198,6 +213,8 @@ def record_event(user_id, name, event_type, amount=1, keyword_message=None):
     if not user_id or not name: raise ValueError('ユーザーIDと表示名を入力してください。')
     if event_type not in {a[4] for a in ACHIEVEMENTS} | set(FIVE_EFFECTS) | {'chat.emote','chat.keyword_message','channel_points.used'}:
         raise ValueError('不明なイベント: '+event_type)
+    if not BRIDGE_ENABLED and (event_type.startswith(('effect.', 'hacking.', 'passing.', 'combo.'))):
+        raise ValueError('TKG専用イベントはTKG接続時のみ記録できます。')
     amount = int(amount)
     if not 1 <= amount <= 100: raise ValueError('不正なイベント数')
     unlocked=[]
@@ -212,7 +229,7 @@ def record_event(user_id, name, event_type, amount=1, keyword_message=None):
                 # set once; combination progress is a boolean condition.
                 db.execute('''INSERT INTO event_counters(user_id,event_type,count) VALUES(?,?,1)
                     ON CONFLICT(user_id,event_type) DO UPDATE SET count=1''',(user_id,'combo.hack'))
-        for aid,title,_,rank,kind,target in ACHIEVEMENTS:
+        for aid,title,_,rank,kind,target in visible_legacy_achievements():
             row=db.execute('SELECT count FROM event_counters WHERE user_id=? AND event_type=?',(user_id,kind)).fetchone()
             count=row[0] if row else 0
             old=db.execute('SELECT unlocked_at FROM progress WHERE user_id=? AND achievement_id=?',(user_id,aid)).fetchone()
@@ -508,7 +525,7 @@ class TwitchChatWorker(QObject):
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Achievement Manager v0.8 Beta')
+        self.setWindowTitle('Achievement Manager v0.8 Beta (公開候補)')
         self.toasts=[]
         self.toast_queue=[]
         self.toast_busy=False
@@ -638,7 +655,7 @@ class App(QMainWindow):
         bridge_controls.addWidget(self.bridge_connect_button)
         bridge_controls.addWidget(self.bridge_disconnect_button)
         f.addRow(bridge_controls)
-        bridge_help=QLabel('任意連携：TKGは同梱しません。接続時のみローカル127.0.0.1:8767で待機します。\n'
+        bridge_help=QLabel('TKG連携の受付中だけ専用実績を一覧とカードに表示します。解除履歴は保持されます。\n任意連携：TKGは同梱しません。接続時のみローカル127.0.0.1:8767で待機します。\n'
                            '連携側は既存の /api/event と認証キーに対応する必要があります。')
         bridge_help.setWordWrap(True)
         f.addRow(bridge_help)
@@ -849,6 +866,7 @@ class App(QMainWindow):
             self.bridge_status.setText('TKG接続：待機中（127.0.0.1:8767）')
             self.bridge_connect_button.setEnabled(False)
             self.bridge_disconnect_button.setEnabled(True)
+            self.refresh_all()
         except OSError as exc:
             BRIDGE_ENABLED=False
             BRIDGE_SIGNAL=None
@@ -868,6 +886,7 @@ class App(QMainWindow):
         self.bridge_status.setText('未接続（手動接続）')
         self.bridge_connect_button.setEnabled(True)
         self.bridge_disconnect_button.setEnabled(False)
+        self.refresh_all()
 
     def on_bridge_event(self,user_id,name,event_type):
         try:
@@ -1013,8 +1032,13 @@ class App(QMainWindow):
     def refresh_all(self):
         with connect() as db:
             users=db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-            unlocks=db.execute("SELECT COUNT(*) FROM progress WHERE unlocked_at IS NOT NULL AND achievement_id LIKE 'v06_%'").fetchone()[0]
-            unlocks+=db.execute('SELECT COUNT(*) FROM v08_progress').fetchone()[0]
+            visible_ids=[a[0] for a in visible_legacy_achievements()]
+            placeholders=','.join('?' for _ in visible_ids)
+            unlocks=db.execute(f'SELECT COUNT(*) FROM progress WHERE unlocked_at IS NOT NULL AND achievement_id IN ({placeholders})', visible_ids).fetchone()[0]
+            visible_custom=[d['id'] for d in visible_v08_definitions()]
+            if visible_custom:
+                placeholders=','.join('?' for _ in visible_custom)
+                unlocks+=db.execute(f'SELECT COUNT(*) FROM v08_progress WHERE achievement_id IN ({placeholders})',visible_custom).fetchone()[0]
             self.stats.setText(f'登録視聴者  {users} 人      累計実績解除  {unlocks} 件')
             rows=db.execute('''SELECT e.occurred_at,u.display_name,
                     COALESCE(a.title,d.title,'（削除済み実績）')
@@ -1025,8 +1049,11 @@ class App(QMainWindow):
                 ORDER BY e.id DESC LIMIT 50''').fetchall()
             self.fill(self.recent,rows)
             rows=db.execute("SELECT title,rank,description,target,event_type FROM achievements WHERE achievement_id LIKE 'v06_%' ORDER BY rank,achievement_id").fetchall()
-            displayed=[(a,'★'*b+'☆'*(5-b),c,d,e) for a,b,c,d,e in rows]
-            for d in v08_definitions():
+            visible_ids={a[0] for a in visible_legacy_achievements()}
+            legacy_rows=db.execute("SELECT achievement_id,title,rank,description,target,event_type FROM achievements WHERE achievement_id LIKE 'v06_%' ORDER BY rank,achievement_id").fetchall()
+            displayed=[(title,'★'*rank+'☆'*(5-rank),description,target,event_type)
+                       for aid,title,rank,description,target,event_type in legacy_rows if aid in visible_ids]
+            for d in visible_v08_definitions():
                 if not d['enabled']:continue
                 conditions=d['conditions']
                 summary=('  '+d['operator']+'  ').join(c['event_type']+((' : '+c['keyword']) if 'keyword' in c else '') for c in conditions)
@@ -1056,12 +1083,15 @@ class App(QMainWindow):
             self.card_table.setRowCount(0); return
         with connect() as db:
             name=db.execute('SELECT display_name FROM users WHERE user_id=?',(uid,)).fetchone()[0]
-            rows=db.execute('''SELECT a.title,a.rank,COALESCE(p.count,0),a.target,p.unlocked_at
+            legacy=db.execute('''SELECT a.achievement_id,a.title,a.rank,COALESCE(p.count,0),a.target,p.unlocked_at
                 FROM achievements a LEFT JOIN progress p ON p.achievement_id=a.achievement_id AND p.user_id=?
                 WHERE a.achievement_id LIKE 'v06_%'
                 ORDER BY a.rank,a.title''',(uid,)).fetchall()
+            visible_ids={a[0] for a in visible_legacy_achievements()}
+            rows=[(title,rank,count,target,at) for aid,title,rank,count,target,at in legacy
+                  if aid in visible_ids]
             custom=[]
-            for d in v08_definitions(True):
+            for d in visible_v08_definitions(True):
                 achieved,percent,counts,targets=v08_status(db,uid,d)
                 at=db.execute('SELECT unlocked_at FROM v08_progress WHERE user_id=? AND achievement_id=?',(uid,d['id'])).fetchone()
                 custom.append((d['title'],d['rank'],bool(at),f'{percent}% ({" / ".join(str(min(n,t))+"/"+str(t) for n,t in zip(counts,targets))})',at[0] if at else None))
