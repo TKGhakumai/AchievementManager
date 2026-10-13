@@ -1,10 +1,11 @@
-name: Windows beta build
+
+name: Windows v0.8 Beta installer
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      - develop-v0.8
 
 jobs:
   build:
@@ -26,10 +27,15 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
+      - name: Check Python syntax
+        shell: pwsh
+        run: |
+          python -m compileall -q main.py achievement_editor.py achievement_core
+
       - name: Build application
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --windowed --onedir --name AchievementManager --add-data "app_config.json;." main.py
+          pyinstaller --noconfirm --clean --windowed --onedir --name AchievementManager --add-data "app_config.json;." --hidden-import keyring.backends.Windows main.py
 
       - name: Install Inno Setup
         shell: pwsh
@@ -41,17 +47,9 @@ jobs:
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\setup.iss"
 
-      - name: Find installer
-        shell: pwsh
-        run: |
-          Get-ChildItem -Path . -Recurse -Filter "*.exe" |
-            Select-Object FullName
-      
-
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: AchievementManager-Windows-Beta
+          name: AchievementManager-v0.8-Beta
           path: dist-installer/*.exe
           if-no-files-found: error
-
