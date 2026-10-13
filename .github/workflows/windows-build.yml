@@ -41,8 +41,18 @@ jobs:
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\setup.iss"
 
+      - name: Find installer
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path . -Recurse -Filter "*.exe" |
+            Select-Object FullName
+      
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
           name: AchievementManager-Windows-Beta
-          path: installer/output/*.exe
+          path: |
+            installer/output/*.exe
+            installer/Output/*.exe
+            Output/*.exe
+          if-no-files-found: error
