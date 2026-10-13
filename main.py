@@ -20,6 +20,7 @@ from pathlib import Path
 
 from PyQt5.QtCore import Qt, QSettings, QTimer, QUrl, QObject, pyqtSignal
 from achievement_editor import Editor as AchievementEditor
+from achievement_core.store import AchievementStore
 from PyQt5.QtGui import QColor, QPainter, QFont
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -82,6 +83,9 @@ def connect():
     return con
 
 def init_db():
+    if DB_PATH.exists() and not (BASE / 'achievements.before_stage4.db').exists():
+        with sqlite3.connect(str(DB_PATH)) as src, sqlite3.connect(str(BASE / 'achievements.before_stage4.db')) as dst:
+            src.backup(dst)
     # Make an untouched backup before the first v0.6 schema migration.
     if DB_PATH.exists() and not (BASE / 'achievements.before_v06.db').exists():
         source = sqlite3.connect(str(DB_PATH))
@@ -106,6 +110,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS event_counters (
             user_id TEXT NOT NULL, event_type TEXT NOT NULL, count INTEGER NOT NULL,
             PRIMARY KEY(user_id,event_type));
+        CREATE TABLE IF NOT EXISTS v08_progress (user_id TEXT NOT NULL, achievement_id TEXT NOT NULL, unlocked_at TEXT NOT NULL, PRIMARY KEY(user_id,achievement_id));
         ''')
         for a in ACHIEVEMENTS:
             db.execute('''INSERT INTO achievements(achievement_id,title,description,rank,event_type,target)
@@ -113,24 +118,80 @@ def init_db():
                 title=excluded.title,description=excluded.description,rank=excluded.rank,
                 event_type=excluded.event_type,target=excluded.target''',a)
 
+    V08_STORE.initialize()
+    # Import existing Stage 3 drafts once, preserving their stable IDs.
+    old=BASE/'achievements_v08_preview.db'
+    if old.exists():
+        with sqlite3.connect(str(old)) as source, connect() as dest:
+            try:
+                source.row_factory=sqlite3.Row
+                for row in source.execute('SELECT * FROM v08_achievement_definitions'):
+                    dest.execute("""INSERT OR IGNORE INTO v08_achievement_definitions
+                        (id,title,description,rank,operator,conditions_json,enabled,source,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)""",tuple(row[k] for k in
+                        ('id','title','description','rank','operator','conditions_json','enabled','source','created_at','updated_at')))
+            except sqlite3.OperationalError:
+                pass
 
 def increment(db, uid, event_type, amount=1):
     db.execute('''INSERT INTO event_counters(user_id,event_type,count) VALUES(?,?,?)
         ON CONFLICT(user_id,event_type) DO UPDATE SET count=count+excluded.count''',(uid,event_type,amount))
 
 
-def record_event(user_id, name, event_type, amount=1):
+# Stage 4: custom definitions share the existing runtime database with user/event history.
+V08_STORE = AchievementStore(DB_PATH)
+
+def v08_definitions(enabled_only=False):
+    rows=V08_STORE.list_all()
+    return [r for r in rows if r['enabled']] if enabled_only else rows
+
+def v08_condition_count(db,uid,condition):
+    kind=condition['event_type']
+    if kind=='chat.keyword':
+        kind='chat.keyword:'+unicodedata.normalize('NFKC',condition['keyword']).casefold()
+    row=db.execute('SELECT count FROM event_counters WHERE user_id=? AND event_type=?',(uid,kind)).fetchone()
+    return row[0] if row else 0
+
+def v08_status(db,uid,definition):
+    conditions=definition['conditions']
+    counts=[v08_condition_count(db,uid,c) for c in conditions]
+    targets=[c['target'] for c in conditions]
+    met=[n>=t for n,t in zip(counts,targets)]
+    achieved=all(met) if definition['operator']=='AND' else any(met)
+    # For AND, show the least completed condition; for OR, the most completed one.
+    ratio=(min if definition['operator']=='AND' else max)(min(n/t,1) for n,t in zip(counts,targets))
+    return achieved,round(ratio*100),counts,targets
+
+def v08_record(db,uid,keyword_message=None):
+    if keyword_message is not None:
+        normalized=unicodedata.normalize('NFKC',keyword_message).casefold()
+        keywords={c['keyword'] for d in v08_definitions(True) for c in d['conditions'] if c['event_type']=='chat.keyword'}
+        for word in keywords:
+            if unicodedata.normalize('NFKC',word).casefold() in normalized:
+                increment(db,uid,'chat.keyword:'+unicodedata.normalize('NFKC',word).casefold())
+    unlocked=[]
+    for d in v08_definitions(True):
+        achieved,_,_,_=v08_status(db,uid,d)
+        if not achieved:continue
+        at=datetime.now().astimezone().isoformat(timespec='seconds')
+        cur=db.execute('INSERT OR IGNORE INTO v08_progress(user_id,achievement_id,unlocked_at) VALUES(?,?,?)',(uid,d['id'],at))
+        if cur.rowcount:
+            db.execute('INSERT INTO event_log(user_id,achievement_id,occurred_at) VALUES(?,?,?)',(uid,d['id'],at))
+            unlocked.append(d['title'])
+    return unlocked
+
+def record_event(user_id, name, event_type, amount=1, keyword_message=None):
     user_id = str(user_id).strip()
     name = str(name).strip()
     if not user_id or not name: raise ValueError('ユーザーIDと表示名を入力してください。')
-    if event_type not in {a[4] for a in ACHIEVEMENTS} | set(FIVE_EFFECTS):
+    if event_type not in {a[4] for a in ACHIEVEMENTS} | set(FIVE_EFFECTS) | {'chat.emote','chat.keyword_message','channel_points.used'}:
         raise ValueError('不明なイベント: '+event_type)
     amount = int(amount)
     if not 1 <= amount <= 100: raise ValueError('不正なイベント数')
     unlocked=[]
     with connect() as db:
         db.execute('INSERT INTO users(user_id,display_name) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name',(user_id,name))
-        increment(db,user_id,event_type,amount)
+        if event_type!='chat.keyword_message': increment(db,user_id,event_type,amount)
         if event_type in FIVE_EFFECTS: increment(db,user_id,'effect.five',amount)
         if event_type in ('hacking.giant','hacking.swarm'):
             giant=db.execute('SELECT count FROM event_counters WHERE user_id=? AND event_type=?',(user_id,'hacking.giant')).fetchone()
@@ -151,6 +212,7 @@ def record_event(user_id, name, event_type, amount=1):
             if at:
                 db.execute('INSERT INTO event_log(user_id,achievement_id,occurred_at) VALUES(?,?,?)',(user_id,aid,at))
                 unlocked.append(title)
+        unlocked.extend(v08_record(db,user_id,keyword_message))
     return unlocked
 
 
@@ -182,6 +244,7 @@ def parse_chat_events(message, emote_tags, target_emote_name="shirat43Gg"):
             if target_emote_name and token.casefold()==target_emote_name: gg=True
     if emote_count: events.append(('chat.emote',min(emote_count,100)))
     if gg: events.append('chat.gg')
+    events.append(('chat.keyword_message',message))
     return events
 
 
@@ -441,7 +504,9 @@ class App(QMainWindow):
         self.twitch_worker.target_emote_name = str(self.prefs.value('gg_emote_name', 'shirat43Gg')).strip()
         self.twitch_worker.event_received.connect(self.on_twitch_event)
         self.twitch_worker.status_changed.connect(self.twitch_status.setText)
-        self.tabs.currentChanged.connect(lambda _: self.refresh_all())
+        self._last_tab_index=self.tabs.currentIndex()
+        self._tab_guard=False
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self.apply_theme()
         self.refresh_all()
         self.start_obs_server()
@@ -449,7 +514,8 @@ class App(QMainWindow):
 
     def make_v08_editor(self):
         # Separate database: v0.7 achievements and progress are not modified.
-        self.v08_editor = AchievementEditor(BASE / 'achievements_v08_preview.db')
+        self.v08_editor = AchievementEditor(DB_PATH)
+        self.v08_editor.saved.connect(self.refresh_all)
         self.v08_editor.setWindowTitle('実績管理')
         self.tabs.addTab(self.v08_editor, '実績管理（v0.8）')
 
@@ -492,7 +558,7 @@ class App(QMainWindow):
         self.tabs.addTab(w,'ダッシュボード')
 
     def make_achievements(self):
-        w,l=self.page(); l.addWidget(QLabel('実績一覧 v0.6（31種類・閲覧のみ）'))
+        w,l=self.page(); l.addWidget(QLabel('実績一覧（既存実績 + カスタム実績）'))
         self.all_table=self.table(['実績名','難易度','解除条件','必要回数','イベントID'])
         l.addWidget(self.all_table); self.tabs.addTab(w,'実績一覧')
 
@@ -720,7 +786,10 @@ class App(QMainWindow):
 
     def on_bridge_event(self,user_id,name,event_type):
         try:
-            unlocked=record_event(user_id,name,event_type[0],event_type[1]) if isinstance(event_type,tuple) else record_event(user_id,name,event_type)
+            if isinstance(event_type,tuple) and event_type[0]=='chat.keyword_message':
+                unlocked=record_event(user_id,name,'chat.keyword_message',keyword_message=event_type[1])
+            else:
+                unlocked=record_event(user_id,name,event_type[0],event_type[1]) if isinstance(event_type,tuple) else record_event(user_id,name,event_type)
             if unlocked: self.queue_unlocks(unlocked,name)
             self.refresh_all()
             self.bridge_status.setText('イベント受信：'+event_type+' / '+name)
@@ -731,7 +800,7 @@ class App(QMainWindow):
         with connect() as db:
             for title in titles:
                 row=db.execute('SELECT rank FROM achievements WHERE title=?',(title,)).fetchone()
-                rank=row[0] if row else 1
+                rank=row[0] if row else next((d['rank'] for d in v08_definitions() if d['title']==title),1)
                 self.toast_queue.append((title,name,rank))
         self.next_toast()
 
@@ -758,6 +827,8 @@ class App(QMainWindow):
         self.next_toast()
 
     def closeEvent(self,event):
+        if self.v08_editor.has_unsaved_changes() and not self.v08_editor.confirm_discard():
+            event.ignore(); return
         self.twitch_worker.stop()
         if self.http_server:
             self.http_server.shutdown()
@@ -802,9 +873,25 @@ class App(QMainWindow):
         self.twitch_worker.stop()
         self.twitch_status.setText('未接続')
 
+    def _on_tab_changed(self,index):
+        if self._tab_guard:return
+        if index!=self._last_tab_index and self.tabs.widget(self._last_tab_index) is self.v08_editor:
+            if not self.v08_editor.confirm_discard():
+                self._tab_guard=True
+                self.tabs.setCurrentIndex(self._last_tab_index)
+                self._tab_guard=False
+                return
+            # Leaving the editor discards the unsaved draft.
+            if self.v08_editor.has_unsaved_changes(): self.v08_editor._reset_form()
+        self._last_tab_index=index
+        self.refresh_all()
+
     def on_twitch_event(self,user_id,name,event_type):
         try:
-            unlocked=record_event(user_id,name,event_type[0],event_type[1]) if isinstance(event_type,tuple) else record_event(user_id,name,event_type)
+            if isinstance(event_type,tuple) and event_type[0]=='chat.keyword_message':
+                unlocked=record_event(user_id,name,'chat.keyword_message',keyword_message=event_type[1])
+            else:
+                unlocked=record_event(user_id,name,event_type[0],event_type[1]) if isinstance(event_type,tuple) else record_event(user_id,name,event_type)
             if unlocked: self.queue_unlocks(unlocked,name)
             self.refresh_all()
         except Exception as exc:
@@ -825,6 +912,7 @@ class App(QMainWindow):
         with connect() as db:
             users=db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
             unlocks=db.execute("SELECT COUNT(*) FROM progress WHERE unlocked_at IS NOT NULL AND achievement_id LIKE 'v06_%'").fetchone()[0]
+            unlocks+=db.execute('SELECT COUNT(*) FROM v08_progress').fetchone()[0]
             self.stats.setText(f'登録視聴者  {users} 人      累計実績解除  {unlocks} 件')
             rows=db.execute('''SELECT e.occurred_at,u.display_name,a.title FROM event_log e
                 JOIN users u ON e.user_id=u.user_id JOIN achievements a ON e.achievement_id=a.achievement_id
@@ -832,7 +920,14 @@ class App(QMainWindow):
                 ORDER BY e.id DESC LIMIT 50''').fetchall()
             self.fill(self.recent,rows)
             rows=db.execute("SELECT title,rank,description,target,event_type FROM achievements WHERE achievement_id LIKE 'v06_%' ORDER BY rank,achievement_id").fetchall()
-            self.fill(self.all_table,[(a,'★'*b+'☆'*(5-b),c,d,e) for a,b,c,d,e in rows])
+            displayed=[(a,'★'*b+'☆'*(5-b),c,d,e) for a,b,c,d,e in rows]
+            for d in v08_definitions():
+                if not d['enabled']:continue
+                conditions=d['conditions']
+                summary=('  '+d['operator']+'  ').join(c['event_type']+((' : '+c['keyword']) if 'keyword' in c else '') for c in conditions)
+                displayed.append((d['title'],'★'*d['rank']+'☆'*(5-d['rank']),summary,
+                    ' / '.join(str(c['target']) for c in conditions), 'カスタム'))
+            self.fill(self.all_table,displayed)
         self.refresh_profiles()
 
     def refresh_profiles(self):
@@ -859,10 +954,17 @@ class App(QMainWindow):
                 FROM achievements a LEFT JOIN progress p ON p.achievement_id=a.achievement_id AND p.user_id=?
                 WHERE a.achievement_id LIKE 'v06_%'
                 ORDER BY a.rank,a.title''',(uid,)).fetchall()
-        done=sum(bool(x[4]) for x in rows); total=len(rows)
+            custom=[]
+            for d in v08_definitions(True):
+                achieved,percent,counts,targets=v08_status(db,uid,d)
+                at=db.execute('SELECT unlocked_at FROM v08_progress WHERE user_id=? AND achievement_id=?',(uid,d['id'])).fetchone()
+                custom.append((d['title'],d['rank'],bool(at),f'{percent}% ({" / ".join(str(min(n,t))+"/"+str(t) for n,t in zip(counts,targets))})',at[0] if at else None))
+        done=sum(bool(x[4]) for x in rows)+sum(x[2] for x in custom); total=len(rows)+len(custom)
         self.card_name.setText(f'🏆 {name}   —   {done} / {total} 解除')
         self.card_progress.setValue(round(done*100/total) if total else 0)
-        self.fill(self.card_table,[(title,'★'*rank+'☆'*(5-rank),'解除済み' if at else '未解除',f'{min(count,target)} / {target}',at or '-') for title,rank,count,target,at in rows])
+        card_rows=[(title,'★'*rank+'☆'*(5-rank),'解除済み' if at else '未解除',f'{min(count,target)} / {target}',at or '-') for title,rank,count,target,at in rows]
+        card_rows.extend((title,'★'*rank+'☆'*(5-rank),'解除済み' if done else '未解除',progress,at or '-') for title,rank,done,progress,at in custom)
+        self.fill(self.card_table,card_rows)
 
     def backup(self):
         dst=BASE / ('achievements_backup_'+datetime.now().strftime('%Y%m%d_%H%M%S')+'.db')
