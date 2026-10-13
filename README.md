@@ -1,36 +1,38 @@
-# Achievement Manager v0.8.0-beta.1 — Windows 配布準備版
+# Achievement Manager v0.8.0-beta.2 — 配布用ソース
 
-このZIPは**Windows EXE / インストーラーを作るためのソース一式**です。完成済みのEXEは含みません。
+**Stage 8の解除済み実績の強調表示、★並び替え、実績編集、TKG任意接続を維持した公開候補版です。**
 
-## v0.8で確認する機能
-- 実績作成・編集、保存前の変更破棄確認、特殊条件（Beta）
-- 実績一覧・個人実績カードへの反映と★昇順・降順
-- 個人実績カードの解除済み実績を青緑色・太字で強調（Stage 8修正を含む）
-- コメント等の実績判定・解除履歴・OBS通知
-- 手動TKG連携受付（TKG本体側の送信実装は別途必要）
+## v0.7のTwitch自動ログインを復元
+「設定・接続」→「Twitchでログイン（自動取得）」で、初回はブラウザ認証（OAuth Authorization Code + PKCE）を行います。
+アクセストークンの手入力は不要です。トークンはWindowsの資格情報保管庫（keyring）に保存し、次回ログインボタンを押したとき再利用・期限切れなら更新します。
+Twitch Client Secretは使用・配布しません。公開Client IDは`app_config.json`に収録済みです。
 
-## GitHub Actionsでインストーラー作成（推奨）
-1. **develop-v0.8**ブランチにこのZIPの中身をアップロード。`.github/workflows/windows-build.yml`を含め、リポジトリのルートに配置。
-2. GitHub → Actions → **Windows v0.8 Beta installer** → **Run workflow** でdevelop-v0.8を選択。
-3. 成功後、実行履歴のArtifactsから `AchievementManager-Setup-v0.8.0-beta.1` をダウンロード。ZIP内にWindowsインストーラーのEXEが入ります。
-4. Windows実機でインストール、起動、v0.7からの更新、DB保持、解除済み強調表示、Twitch/OBS接続、アンインストールを検証。
-5. 検証完了後にGitHub Releases → Draft a new release → tag `v0.8.0-beta.1`、Targetは検証済みコミット、**Set as a pre-release**にチェック。Actionsで作成したインストーラーを添付して公開。
+**Twitch開発者コンソールで、Client IDに対応するアプリのリダイレクトURL `http://localhost:3000/` が登録されていることを確認してください。**
+ポート3000が使用中だと初回認証できません。
 
-**注意:** タグをpushするとActionsが走りますが、Releasesへの自動公開は行いません。
+## 公開向けUI
+ダッシュボードのテストイベント送信欄・テストチャット入力欄を削除しました。
+`test_user_001`等の既存テストデータがユーザーのDBに残っている場合、データ保護のため自動削除しません。
 
-## Windowsローカルビルド
-Python 3.12、PowerShell、Inno Setup 6が必要です。
-```
+## GitHub ActionsでWindowsインストーラーを生成
+1. `develop-v0.8`ブランチにZIPの**中身**をアップロード（`.github/workflows/windows-build.yml`を含む）。
+2. GitHub → Actions → `Windows v0.8 Beta installer` → Run workflow → `develop-v0.8`。
+3. Artifactsから `AchievementManager-Setup-v0.8.0-beta.2` を取得。
+4. Windowsで新規インストール、v0.7からの上書き、Twitch認証、チャット進捗、OBS、解除済み強調表示を検証。
+5. 合格後、GitHub Releasesにタグ `v0.8.0-beta.2` で **Pre-release** としてインストーラーを添付。
+
+このZIPには完成済みWindows EXEは含まれません。インストーラー公開は実機検証後に行ってください。
+
+## ローカルビルド
+Windows + Python 3.12 + Inno Setup 6:
+```powershell
 ./build/build_windows.ps1
 & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' 'installer\setup.iss'
 ```
-Windows上で `dist/AchievementManager/AchievementManager.exe` と `dist-installer/AchievementManager-Setup-v0.8.0-beta.1.exe` が生成されます。
 
-## 重要な互換性・制限
-- v0.7と同じInno Setup AppIdとインストール先を使用し、上書き更新を想定します。
-- DBは `%LOCALAPPDATA%\AchievementManager\achievements.db` に保存され、アプリ更新時に削除しません。**必ず手動バックアップ**してから更新してください。
-- このv0.8 Stage 8のTwitch接続画面は**手動アクセストークン入力方式**です。v0.7のPKCE自動ログインはこのソースに含まれていません。以前の自動ログインが必須なら**公開前に復元・統合が必要**です。
-- TKG本体ソース、個人用素材、トークン、Client Secret、ユーザーDBを公開しないでください。
-- v0.8インストーラーはこの環境では実ビルド・起動未検証。Windows GitHub Actionsの結果と実機テストが必要です。
-- GitHub Releasesへの自動公開、アプリ内自動更新は含みません。
-- `main.py` は標準ライブラリとPyQt5を使用し、`achievement_editor.py` と `achievement_core/` を同梱します。
+## 注意
+- DB保存先: `%LOCALAPPDATA%\AchievementManager\achievements.db`。アップグレード前にバックアップしてください。
+- 既存31実績のうち配信者固有のものやTKG専用のものは、今回の更新では除外していません。**一般向け公開前に初期実績の構成を確認してください。**
+- TKG本体・秘密鍵・ユーザーDBは同梱しません。TKGイベント送信側の実装は別途必要です。
+- GitHub ActionsのWindowsビルド、実際のTwitch認証、OBS通知はこの環境では未検証です。
+- アプリ内自動アップデートはまだ実装していません。

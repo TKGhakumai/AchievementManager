@@ -11,7 +11,8 @@ if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
 & $python -m pip install -r requirements.txt
 if ($LASTEXITCODE -ne 0) { throw 'dependency installation failed' }
 & $python -m PyInstaller --noconfirm --clean --windowed --onedir --name AchievementManager `
-    --collect-all PyQt5.QtMultimedia --collect-submodules achievement_core main.py
+    --collect-all PyQt5.QtMultimedia --collect-submodules achievement_core `
+    --add-data "app_config.json;." --hidden-import keyring.backends.Windows main.py
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
 if (-not (Test-Path 'dist/AchievementManager/AchievementManager.exe')) { throw 'EXE not found' }
 Write-Host 'Built: dist/AchievementManager/AchievementManager.exe'

@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QSettings, QTimer, QUrl, QObject, pyqtSignal
+import twitch_oauth
 from achievement_editor import Editor as AchievementEditor
 from achievement_core.store import AchievementStore
 from achievement_core.sorting import sort_achievements
@@ -36,6 +37,16 @@ BRIDGE_KEY_PATH = BASE / 'bridge_key.txt'
 if not BRIDGE_KEY_PATH.exists():
     BRIDGE_KEY_PATH.write_text(secrets.token_urlsafe(32), encoding='utf-8')
 BRIDGE_KEY = BRIDGE_KEY_PATH.read_text(encoding='utf-8').strip()
+
+
+def public_client_id():
+    """Public Twitch application Client ID, packaged with the application."""
+    path = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)) / 'app_config.json'
+    try:
+        client_id = str(json.loads(path.read_text(encoding='utf-8')).get('twitch_client_id', '')).strip()
+    except (OSError, ValueError):
+        return ''
+    return client_id if re.fullmatch(r'[a-z0-9]{20,40}', client_id) else ''
 
 
 # ID, name, description, rank, event_type, target. v0.6 canonical 31 achievements.
@@ -413,6 +424,11 @@ def make_default_sound(path):
         f.setnchannels(1);f.setsampwidth(2);f.setframerate(rate)
         f.writeframes(struct.pack('<'+'h'*len(samples),*samples))
 
+class OAuthEvents(QObject):
+    success = pyqtSignal(str, str, str)
+    failure = pyqtSignal(str)
+
+
 class TwitchChatWorker(QObject):
     event_received = pyqtSignal(str, str, object)
     status_changed = pyqtSignal(str)
@@ -492,7 +508,7 @@ class TwitchChatWorker(QObject):
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Achievement Manager v0.8 Beta (Stage 8 開発版)')
+        self.setWindowTitle('Achievement Manager v0.8 Beta')
         self.toasts=[]
         self.toast_queue=[]
         self.toast_busy=False
@@ -505,6 +521,10 @@ class App(QMainWindow):
         self.default_sound=BASE/'default_unlock.wav'
         make_default_sound(self.default_sound)
         self.prefs = QSettings('AchievementManager', 'AchievementManager')
+        self.oauth_events = OAuthEvents()
+        self.oauth_events.success.connect(self.on_oauth_success)
+        self.oauth_events.failure.connect(self.on_oauth_failure)
+        self.oauth_busy = False
         self.resize(1040, 740)
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -556,25 +576,6 @@ class App(QMainWindow):
         w,l=self.page()
         self.stats=QLabel(); self.stats.setStyleSheet('font-size:17pt;font-weight:bold;')
         l.addWidget(QLabel('ダッシュボード')); l.addWidget(self.stats)
-        group=QGroupBox('テスト実績解除（Twitch未接続でも動作）')
-        g=QFormLayout(group)
-        self.test_id=QLineEdit('test_user_001'); self.test_name=QLineEdit('viewer_a')
-        self.event_select=QComboBox()
-        for label,ev in [('コメント','chat.comment'),('???','chat.questions'),('www','chat.laugh'),('顔文字','chat.kaomoji'),('挨拶','chat.greeting'),('TKG','chat.tkg'),('GGスタンプ','chat.gg'),('エモート','chat.emote'),('通ります','effect.passing'),('お邪魔します','effect.meteor'),('フラッシュ','effect.flash'),('ガラス','effect.glass'),('スモーク','effect.smoke'),('チャネポ全体','effect.used'),('ハッキング','hacking.used'),('ハッキング巨大化','hacking.giant'),('ハッキング60体','hacking.swarm'),('通ります巨大化','passing.giant'),('通ります花火','passing.fireworks')]:
-            self.event_select.addItem(label,ev)
-        btn=QPushButton('テストイベントを送信'); btn.clicked.connect(self.test_event)
-        g.addRow('TwitchユーザーID（テスト用）',self.test_id)
-        g.addRow('表示名',self.test_name); g.addRow('イベント',self.event_select); g.addRow(btn)
-        self.test_chat_text=QLineEdit()
-        self.test_chat_text.setPlaceholderText('例：こんにちは www （チャット受信と同じ判定をテスト）')
-        chat_btn=QPushButton('チャット本文でテスト')
-        chat_btn.clicked.connect(self.test_chat_message)
-        g.addRow('チャット本文',self.test_chat_text)
-        g.addRow(chat_btn)
-        l.addWidget(group)
-        self.event_feedback=QLabel('テストイベントの記録待ち')
-        self.event_feedback.setWordWrap(True)
-        l.addWidget(self.event_feedback)
         l.addWidget(QLabel('最近の実績解除'))
         self.recent=self.table(['日時','視聴者','実績']); l.addWidget(self.recent)
         self.tabs.addTab(w,'ダッシュボード')
@@ -644,19 +645,21 @@ class App(QMainWindow):
         f.addRow('OBS通知', QLabel('http://127.0.0.1:8766/'))
         self.twitch_channel=QLineEdit(); self.twitch_channel.setPlaceholderText('配信チャンネル名（英数字）')
         self.twitch_channel.setText(str(self.prefs.value('twitch_channel','')))
-        self.twitch_nick=QLineEdit(); self.twitch_nick.setPlaceholderText('ログインしたTwitchユーザー名')
+        self.twitch_nick=QLineEdit()
+        self.twitch_nick.setReadOnly(True)
         self.twitch_nick.setText(str(self.prefs.value('twitch_nick','')))
-        self.twitch_token=QLineEdit(); self.twitch_token.setEchoMode(QLineEdit.Password)
-        self.twitch_token.setPlaceholderText('チャット読み取り用OAuthアクセストークン（保存しません）')
         f.addRow('配信チャンネル',self.twitch_channel)
-        f.addRow('ログイン名',self.twitch_nick)
-        f.addRow('アクセストークン',self.twitch_token)
-        buttons=QHBoxLayout()
-        start=QPushButton('Twitchチャット接続'); start.clicked.connect(self.connect_twitch)
-        stop=QPushButton('切断'); stop.clicked.connect(self.disconnect_twitch)
-        buttons.addWidget(start); buttons.addWidget(stop)
-        f.addRow(buttons)
-        f.addRow(QLabel('※ チャット読み取り権限が必要。トークンは保存しません。'))
+        f.addRow('認証アカウント',self.twitch_nick)
+        self.oauth_button=QPushButton('Twitchでログイン（自動取得）')
+        self.oauth_button.clicked.connect(self.oauth_login)
+        f.addRow(self.oauth_button)
+        self.oauth_logout_button=QPushButton('Twitch認証情報を削除')
+        self.oauth_logout_button.clicked.connect(self.oauth_logout)
+        f.addRow(self.oauth_logout_button)
+        stop=QPushButton('チャット切断')
+        stop.clicked.connect(self.disconnect_twitch)
+        f.addRow(stop)
+        f.addRow(QLabel('※ ブラウザで初回認証。アクセストークンの手入力は不要です。'))
         f.addRow(QLabel('※ TKG連携時はこのアプリでTwitchチャットにも接続してください。'))
         l.addWidget(group)
         emote_group=QGroupBox('特定スタンプ実績の設定'); ef=QFormLayout(emote_group)
@@ -918,33 +921,63 @@ class App(QMainWindow):
         self.stop_bridge_server()
         super().closeEvent(event)
 
-    def connect_twitch(self):
-        channel=self.twitch_channel.text().strip().lstrip('#').lower()
-        nick=self.twitch_nick.text().strip().lower()
-        token=self.twitch_token.text().strip()
-        if token.lower().startswith('oauth:'): token=token[6:]
-        if not re.fullmatch(r'[a-z0-9_]{3,25}',channel or '') or not re.fullmatch(r'[a-z0-9_]{3,25}',nick or '') or not token:
-            QMessageBox.warning(self,'入力エラー','チャンネル名・ログイン名・アクセストークンを確認してください。')
+    def oauth_login(self):
+        client_id = public_client_id()
+        if not client_id:
+            QMessageBox.warning(self, '設定エラー', 'Twitch Client IDが設定されていません。')
             return
-        self.prefs.setValue('twitch_channel',channel)
-        self.prefs.setValue('twitch_nick',nick)
+        if self.oauth_busy:
+            return
+        self.oauth_busy = True
+        self.oauth_button.setEnabled(False)
+        self.twitch_status.setText('Twitch認証中…')
+
+        def worker():
+            try:
+                token = twitch_oauth.restore(client_id)
+                if not token:
+                    token = twitch_oauth.login(client_id)
+                identity = twitch_oauth.get_identity(token)
+                if identity.get('client_id') != client_id or 'chat:read' not in identity.get('scopes', []):
+                    raise RuntimeError('Client IDまたはチャット読み取り権限が一致しません。')
+                self.oauth_events.success.emit(identity['login'], token, client_id)
+            except Exception as exc:
+                self.oauth_events.failure.emit(str(exc))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_oauth_success(self, nick, token, client_id):
+        self.oauth_busy = False
+        self.oauth_button.setEnabled(True)
+        self.twitch_nick.setText(nick)
+        channel = self.twitch_channel.text().strip().lstrip('#').lower() or nick
+        if not re.fullmatch(r'[a-z0-9_]{3,25}', channel):
+            self.on_oauth_failure('配信チャンネル名を確認してください。')
+            return
+        self.twitch_channel.setText(channel)
+        self.prefs.setValue('twitch_channel', channel)
+        self.prefs.setValue('twitch_nick', nick)
         global BRIDGE_TOKEN, BRIDGE_CLIENT_ID
         with BRIDGE_TOKEN_LOCK:
-            BRIDGE_TOKEN=token
-            BRIDGE_CLIENT_ID=None
-        def load_client_id():
-            global BRIDGE_CLIENT_ID
+            BRIDGE_TOKEN, BRIDGE_CLIENT_ID = token, client_id
+        self.twitch_worker.start(channel, nick, token)
+
+    def on_oauth_failure(self, message):
+        self.oauth_busy = False
+        self.oauth_button.setEnabled(True)
+        self.twitch_status.setText('Twitch認証に失敗しました')
+        QMessageBox.warning(self, 'Twitch認証エラー', message)
+
+    def oauth_logout(self):
+        client_id = public_client_id()
+        if client_id:
             try:
-                req=urllib.request.Request('https://id.twitch.tv/oauth2/validate',headers={'Authorization':'OAuth '+token})
-                with urllib.request.urlopen(req,timeout=10) as response:
-                    client_id=json.load(response).get('client_id')
-                with BRIDGE_TOKEN_LOCK:
-                    if BRIDGE_TOKEN==token: BRIDGE_CLIENT_ID=client_id
-            except Exception:
-                pass
-        threading.Thread(target=load_client_id,daemon=True).start()
-        self.twitch_worker.start(channel,nick,token)
-        self.twitch_token.clear()
+                twitch_oauth.clear(client_id)
+            except Exception as exc:
+                QMessageBox.warning(self, '認証情報の削除エラー', str(exc))
+                return
+        self.disconnect_twitch()
+        self.twitch_nick.clear()
+        QMessageBox.information(self, 'ログアウト', '保存されたTwitch認証情報を削除しました。')
 
     def disconnect_twitch(self):
         global BRIDGE_TOKEN, BRIDGE_CLIENT_ID
@@ -976,42 +1009,6 @@ class App(QMainWindow):
             self.refresh_all()
         except Exception as exc:
             self.twitch_status.setText('記録エラー：'+str(exc))
-
-    def test_event(self):
-        try:
-            unlocked=record_event(self.test_id.text(),self.test_name.text(),self.event_select.currentData())
-        except ValueError as exc:
-            QMessageBox.warning(self,'入力エラー',str(exc)); return
-        self.refresh_all()
-        self.event_feedback.setText(
-            ('解除成功：'+'、'.join(unlocked)) if unlocked else 'イベントを記録しました（新しい解除なし）')
-        if unlocked:
-            self.queue_unlocks(unlocked,self.test_name.text())
-        else:
-            QMessageBox.information(self,'イベント受信','進捗を記録しました。未解除の新しい実績はありません。')
-
-    def test_chat_message(self):
-        message=self.test_chat_text.text()
-        if not message.strip():
-            QMessageBox.warning(self,'入力エラー','テスト用のチャット本文を入力してください。')
-            return
-        try:
-            unlocked=[]
-            for ev in parse_chat_events(message, '', self.twitch_worker.target_emote_name):
-                if isinstance(ev,tuple) and ev[0]=='chat.keyword_message':
-                    unlocked.extend(record_event(self.test_id.text(),self.test_name.text(),
-                        'chat.keyword_message',keyword_message=ev[1]))
-                elif isinstance(ev,tuple):
-                    unlocked.extend(record_event(self.test_id.text(),self.test_name.text(),ev[0],ev[1]))
-                else:
-                    unlocked.extend(record_event(self.test_id.text(),self.test_name.text(),ev))
-        except (ValueError,sqlite3.Error) as exc:
-            QMessageBox.warning(self,'テストエラー',str(exc))
-            return
-        self.refresh_all()
-        self.event_feedback.setText('チャット解析テスト：'+
-            ('解除 '+ '、'.join(unlocked) if unlocked else '記録成功・新しい解除なし'))
-        if unlocked:self.queue_unlocks(unlocked,self.test_name.text())
 
     def refresh_all(self):
         with connect() as db:
