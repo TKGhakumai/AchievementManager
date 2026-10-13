@@ -1,5 +1,5 @@
 #define MyAppName "Achievement Manager"
-#define MyAppVersion "0.8.0-beta.4"
+#define MyAppVersion "0.8.0-beta.6"
 #define MyAppPublisher "Achievement Manager Contributors"
 #define MyAppExeName "AchievementManager.exe"
 [Setup]
@@ -12,7 +12,7 @@ DefaultDirName={localappdata}\Programs\AchievementManager
 DefaultGroupName={#MyAppName}
 PrivilegesRequired=lowest
 OutputDir=..\dist-installer
-OutputBaseFilename=AchievementManager-Setup-v0.8.0-beta.4
+OutputBaseFilename=AchievementManager-Setup-v0.8.0-beta.6
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

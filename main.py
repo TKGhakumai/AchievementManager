@@ -15,11 +15,12 @@ import secrets
 import urllib.request
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QSettings, QTimer, QUrl, QObject, pyqtSignal
+from PyQt5.QtCore import Qt, QSettings, QTimer, QUrl, QObject, pyqtSignal, QProcess
 import twitch_oauth
+import update_service
 from achievement_editor import Editor as AchievementEditor
 from achievement_core.store import AchievementStore
 from achievement_core.sorting import sort_achievements
@@ -525,14 +526,26 @@ class TwitchChatWorker(QObject):
             self.event_received.emit(uid,name,ev)
 
 
+class UpdateEvents(QObject):
+    checked = pyqtSignal(object, bool)
+    failed = pyqtSignal(str, bool)
+    downloaded = pyqtSignal(str)
+    download_failed = pyqtSignal(str)
+    progress = pyqtSignal(int)
+
+
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Achievement Manager v0.8 Beta')
+        self.setWindowTitle('Achievement Manager v0.8 Beta.6')
         self.toasts=[]
         self.toast_queue=[]
         self.toast_busy=False
         self.notification_serial=0
+        # Dashboard is a session view; never delete persistent event history.
+        with connect() as db:
+            self.dashboard_after_id=db.execute('SELECT COALESCE(MAX(id),0) FROM event_log').fetchone()[0]
+
         self.http_server=None
         self.bridge_server=None
         self.bridge_emitter=BridgeEmitter()
@@ -545,6 +558,15 @@ class App(QMainWindow):
         self.oauth_events.success.connect(self.on_oauth_success)
         self.oauth_events.failure.connect(self.on_oauth_failure)
         self.oauth_busy = False
+        self.update_events = UpdateEvents()
+        self.update_events.checked.connect(self.on_update_checked)
+        self.update_events.failed.connect(self.on_update_check_failed)
+        self.update_events.downloaded.connect(self.on_update_downloaded)
+        self.update_events.download_failed.connect(self.on_update_download_failed)
+        self.update_events.progress.connect(self.on_update_progress)
+        self.update_busy = False
+        self.update_download_busy = False
+        self.update_info = None
         self.resize(1040, 740)
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -562,7 +584,13 @@ class App(QMainWindow):
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.apply_theme()
         self.refresh_all()
+        self.new_refresh_timer=QTimer(self)
+        self.new_refresh_timer.setInterval(30000)
+        self.new_refresh_timer.timeout.connect(self.refresh_card)
+        self.new_refresh_timer.start()
         self.start_obs_server()
+        # Never block startup; user must approve any installation.
+        QTimer.singleShot(2500, lambda: self.check_for_updates(False))
         # TKG bridge stays OFF until the user explicitly enables it.
 
     def make_v08_editor(self):
@@ -596,7 +624,13 @@ class App(QMainWindow):
         w,l=self.page()
         self.stats=QLabel(); self.stats.setStyleSheet('font-size:17pt;font-weight:bold;')
         l.addWidget(QLabel('ダッシュボード')); l.addWidget(self.stats)
-        l.addWidget(QLabel('最近の実績解除'))
+        history_bar=QHBoxLayout()
+        history_bar.addWidget(QLabel('起動後の実績解除ログ'))
+        history_bar.addStretch()
+        clear_history=QPushButton('ログをクリア')
+        clear_history.clicked.connect(self.clear_dashboard_log)
+        history_bar.addWidget(clear_history)
+        l.addLayout(history_bar)
         self.recent=self.table(['日時','視聴者','実績']); l.addWidget(self.recent)
         self.tabs.addTab(w,'ダッシュボード')
 
@@ -734,6 +768,16 @@ class App(QMainWindow):
         preview=QPushButton('サウンド試聴');preview.clicked.connect(lambda:self.play_sound(1,force=True))
         sf.addRow(preview)
         l.addWidget(sounds)
+        updates=QGroupBox('アプリのアップデート'); uf=QFormLayout(updates)
+        uf.addRow('現在のバージョン', QLabel('v' + update_service.CURRENT_VERSION))
+        self.update_status=QLabel('起動後に更新を確認します')
+        self.update_status.setWordWrap(True)
+        uf.addRow('更新状況', self.update_status)
+        self.update_button=QPushButton('今すぐ更新を確認')
+        self.update_button.clicked.connect(lambda: self.check_for_updates(True))
+        uf.addRow(self.update_button)
+        uf.addRow(QLabel('GitHub Releasesを確認します。更新は確認後のみ実行します。'))
+        l.addWidget(updates)
         group3=QGroupBox('データ管理'); f3=QFormLayout(group3)
         path_label=QLabel(str(DB_PATH)); path_label.setWordWrap(True)
         backup=QPushButton('データベースをバックアップ'); backup.clicked.connect(self.backup)
@@ -1034,6 +1078,24 @@ class App(QMainWindow):
         except Exception as exc:
             self.twitch_status.setText('記録エラー：'+str(exc))
 
+    def clear_dashboard_log(self):
+        # Clearing only changes the session's lower bound, not the database.
+        with connect() as db:
+            self.dashboard_after_id=db.execute('SELECT COALESCE(MAX(id),0) FROM event_log').fetchone()[0]
+        self.recent.setRowCount(0)
+
+    @staticmethod
+    def is_new_unlock(value):
+        if not value or value == '-':
+            return False
+        try:
+            unlocked_at=datetime.fromisoformat(value)
+            now=datetime.now(unlocked_at.tzinfo) if unlocked_at.tzinfo else datetime.now()
+            age=now-unlocked_at
+            return timedelta(0) <= age < timedelta(hours=12)
+        except (TypeError,ValueError,OverflowError):
+            return False
+
     def refresh_all(self):
         with connect() as db:
             users=db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
@@ -1051,7 +1113,8 @@ class App(QMainWindow):
                 JOIN users u ON e.user_id=u.user_id
                 LEFT JOIN achievements a ON e.achievement_id=a.achievement_id
                 LEFT JOIN v08_achievement_definitions d ON e.achievement_id=d.id
-                ORDER BY e.id DESC LIMIT 50''').fetchall()
+                WHERE e.id > ?
+                ORDER BY e.id DESC LIMIT 50''',(self.dashboard_after_id,)).fetchall()
             self.fill(self.recent,rows)
             visible_ids={a[0] for a in visible_legacy_achievements()}
             legacy_rows=db.execute("SELECT achievement_id,title,rank,description,target,event_type FROM achievements WHERE achievement_id LIKE 'v06_%' ORDER BY rank,achievement_id").fetchall()
@@ -1106,6 +1169,13 @@ class App(QMainWindow):
         card_rows.extend((title,'★'*rank+'☆'*(5-rank),'解除済み' if done else '未解除',progress,at or '-') for title,rank,done,progress,at in custom)
         card_rows=sort_achievements(card_rows, self.card_rank_order.currentData(), rank_index=1)
         self.fill(self.card_table,card_rows)
+        # Display NEW without altering the persisted unlock status.
+        for index,row in enumerate(card_rows):
+            if row[2] == '解除済み' and self.is_new_unlock(row[4]):
+                title_item=self.card_table.item(index,0)
+                if title_item:
+                    title_item.setText('NEW  ' + title_item.text())
+                    title_item.setToolTip('解除から12時間以内の新しい実績')
         self.highlight_unlocked_card_rows(card_rows)
 
     def highlight_unlocked_card_rows(self, card_rows):
@@ -1130,6 +1200,97 @@ class App(QMainWindow):
                     item.setToolTip('解除済みの実績')
                 else:
                     item.setToolTip('未解除の実績')
+
+    def check_for_updates(self, manual=False):
+        if self.update_busy or self.update_download_busy:
+            return
+        self.update_busy = True
+        self.update_button.setEnabled(False)
+        self.update_status.setText('GitHub Releasesを確認中…')
+        def worker():
+            try:
+                result = update_service.find_update()
+                self.update_events.checked.emit(result, manual)
+            except Exception as exc:
+                self.update_events.failed.emit(str(exc), manual)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_update_checked(self, info, manual):
+        self.update_busy = False
+        self.update_button.setEnabled(True)
+        if not info:
+            self.update_status.setText('現在のバージョンが最新です')
+            if manual:
+                QMessageBox.information(self, '更新確認', '新しいバージョンはありません。')
+            return
+        self.update_info = info
+        self.update_status.setText('新しいバージョン: v' + info['version'])
+        answer = QMessageBox.question(
+            self, 'アップデートがあります',
+            '現在: v' + update_service.CURRENT_VERSION + '\n'
+            '新しいバージョン: v' + info['version'] + '\n\n'
+            'GitHub Releasesからインストーラーをダウンロードしますか？\n'
+            '（ダウンロード後、インストール前にも確認します）',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            self.start_update_download(info)
+
+    def on_update_check_failed(self, message, manual):
+        self.update_busy = False
+        self.update_button.setEnabled(True)
+        self.update_status.setText('更新確認に失敗しました（オフラインでも使用できます）')
+        if manual:
+            QMessageBox.warning(self, '更新確認エラー', message)
+
+    def start_update_download(self, info):
+        if self.update_download_busy:
+            return
+        self.update_download_busy = True
+        self.update_button.setEnabled(False)
+        self.update_status.setText('インストーラーをダウンロード中…')
+        def worker():
+            try:
+                path = update_service.download_installer(
+                    info, lambda current, total: self.update_events.progress.emit(int(current * 100 / total)))
+                self.update_events.downloaded.emit(path)
+            except Exception as exc:
+                self.update_events.download_failed.emit(str(exc))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_update_progress(self, percent):
+        self.update_status.setText(f'ダウンロード中… {percent}%')
+
+    def on_update_download_failed(self, message):
+        self.update_download_busy = False
+        self.update_button.setEnabled(True)
+        self.update_status.setText('ダウンロードに失敗しました')
+        QMessageBox.warning(self, '更新エラー', message)
+
+    def on_update_downloaded(self, path):
+        self.update_download_busy = False
+        self.update_button.setEnabled(True)
+        self.update_status.setText('インストーラーをダウンロードしました')
+        if self.v08_editor.has_unsaved_changes():
+            QMessageBox.information(self, '未保存の編集', '実績管理に未保存の変更があります。保存または破棄してから更新してください。')
+            return
+        answer = QMessageBox.question(
+            self, 'アップデートのインストール',
+            '既存の実績データをバックアップしてからアプリを終了し、\n'
+            '新しいインストーラーを起動します。よろしいですか？\n\n'
+            'Windowsのインストール画面でも操作が必要です。',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            backup_path = BASE / ('achievements_pre_update_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '.db')
+            with connect() as source, sqlite3.connect(str(backup_path)) as target:
+                source.backup(target)
+            if not QProcess.startDetached(path, []):
+                raise RuntimeError('インストーラーを起動できませんでした。')
+        except Exception as exc:
+            QMessageBox.critical(self, '更新準備エラー', str(exc))
+            return
+        QApplication.instance().quit()
 
     def backup(self):
         dst=BASE / ('achievements_backup_'+datetime.now().strftime('%Y%m%d_%H%M%S')+'.db')
