@@ -94,7 +94,7 @@ class Editor(QWidget):
         buttons.addWidget(save)
         buttons.addWidget(disable)
         right.addLayout(buttons)
-        right.addWidget(QLabel('※ v0.7本体とは未接続。デモ用SQLiteに保存します。'))
+        right.addWidget(QLabel('※ v0.8試験機能：保存と編集のみ対応。実績解除判定には未接続です。'))
         right.addStretch()
         root.addLayout(right, 2)
         self.refresh()
