@@ -47,12 +47,11 @@ jobs:
           Get-ChildItem -Path . -Recurse -Filter "*.exe" |
             Select-Object FullName
       
+
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
           name: AchievementManager-Windows-Beta
-          path: |
-            installer/output/*.exe
-            installer/Output/*.exe
-            Output/*.exe
+          path: dist-installer/*.exe
           if-no-files-found: error
+
