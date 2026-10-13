@@ -21,6 +21,7 @@ from pathlib import Path
 from PyQt5.QtCore import Qt, QSettings, QTimer, QUrl, QObject, pyqtSignal
 from achievement_editor import Editor as AchievementEditor
 from achievement_core.store import AchievementStore
+from achievement_core.sorting import sort_achievements
 from PyQt5.QtGui import QColor, QPainter, QFont
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -479,7 +480,7 @@ class TwitchChatWorker(QObject):
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Achievement Manager v0.8 Beta (開発版)')
+        self.setWindowTitle('Achievement Manager v0.8 Beta (Stage 5 開発版)')
         self.toasts=[]
         self.toast_queue=[]
         self.toast_busy=False
@@ -559,7 +560,16 @@ class App(QMainWindow):
 
     def make_achievements(self):
         w,l=self.page(); l.addWidget(QLabel('実績一覧（既存実績 + カスタム実績）'))
-        self.all_table=self.table(['実績名','難易度','解除条件','必要回数','イベントID'])
+        bar=QHBoxLayout(); bar.addWidget(QLabel('★ ランク順'))
+        self.all_rank_order=QComboBox()
+        self.all_rank_order.addItem('昇順（★1 → ★5）','asc')
+        self.all_rank_order.addItem('降順（★5 → ★1）','desc')
+        self.all_rank_order.currentIndexChanged.connect(self.refresh_all)
+        bar.addWidget(self.all_rank_order); bar.addStretch()
+        l.addLayout(bar)
+        self.all_table=self.table(['実績名','★ ランク','解除条件','必要回数','イベントID'])
+        self.all_table.horizontalHeader().sectionClicked.connect(
+            lambda column: self._toggle_rank_order(self.all_rank_order) if column==1 else None)
         l.addWidget(self.all_table); self.tabs.addTab(w,'実績一覧')
 
     def make_profiles(self):
@@ -575,6 +585,10 @@ class App(QMainWindow):
         self.card_table=self.table(['実績','ランク','状態','進捗','解除日時'])
         l.addWidget(self.card_table)
         self.tabs.addTab(w,'個人実績カード')
+
+    @staticmethod
+    def _toggle_rank_order(combo):
+        combo.setCurrentIndex(1 - combo.currentIndex())
 
     def make_settings(self):
         w,l=self.page()
@@ -927,6 +941,7 @@ class App(QMainWindow):
                 summary=('  '+d['operator']+'  ').join(c['event_type']+((' : '+c['keyword']) if 'keyword' in c else '') for c in conditions)
                 displayed.append((d['title'],'★'*d['rank']+'☆'*(5-d['rank']),summary,
                     ' / '.join(str(c['target']) for c in conditions), 'カスタム'))
+            displayed=sort_achievements(displayed, self.all_rank_order.currentData(), rank_index=1)
             self.fill(self.all_table,displayed)
         self.refresh_profiles()
 
@@ -964,6 +979,7 @@ class App(QMainWindow):
         self.card_progress.setValue(round(done*100/total) if total else 0)
         card_rows=[(title,'★'*rank+'☆'*(5-rank),'解除済み' if at else '未解除',f'{min(count,target)} / {target}',at or '-') for title,rank,count,target,at in rows]
         card_rows.extend((title,'★'*rank+'☆'*(5-rank),'解除済み' if done else '未解除',progress,at or '-') for title,rank,done,progress,at in custom)
+        card_rows=sort_achievements(card_rows, self.card_rank_order.currentData(), rank_index=1)
         self.fill(self.card_table,card_rows)
 
     def backup(self):
