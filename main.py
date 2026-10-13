@@ -16,10 +16,12 @@ import urllib.request
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
-import twitch_oauth
 from pathlib import Path
 
 from PyQt5.QtCore import Qt, QSettings, QTimer, QUrl, QObject, pyqtSignal
+from achievement_editor import Editor as AchievementEditor
+from achievement_core.store import AchievementStore
+from achievement_core.sorting import sort_achievements
 from PyQt5.QtGui import QColor, QPainter, QFont
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -34,16 +36,6 @@ BRIDGE_KEY_PATH = BASE / 'bridge_key.txt'
 if not BRIDGE_KEY_PATH.exists():
     BRIDGE_KEY_PATH.write_text(secrets.token_urlsafe(32), encoding='utf-8')
 BRIDGE_KEY = BRIDGE_KEY_PATH.read_text(encoding='utf-8').strip()
-
-def public_client_id():
-    """The publisher's public Client ID, never a Client Secret."""
-    config_path = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)) / 'app_config.json'
-    try:
-        value = str(json.loads(config_path.read_text(encoding='utf-8')).get('twitch_client_id', '')).strip()
-    except (OSError, ValueError):
-        return ''
-    return value if re.fullmatch(r'[a-z0-9]{20,40}', value) else ''
-
 
 
 # ID, name, description, rank, event_type, target. v0.6 canonical 31 achievements.
@@ -92,6 +84,9 @@ def connect():
     return con
 
 def init_db():
+    if DB_PATH.exists() and not (BASE / 'achievements.before_stage4.db').exists():
+        with sqlite3.connect(str(DB_PATH)) as src, sqlite3.connect(str(BASE / 'achievements.before_stage4.db')) as dst:
+            src.backup(dst)
     # Make an untouched backup before the first v0.6 schema migration.
     if DB_PATH.exists() and not (BASE / 'achievements.before_v06.db').exists():
         source = sqlite3.connect(str(DB_PATH))
@@ -116,6 +111,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS event_counters (
             user_id TEXT NOT NULL, event_type TEXT NOT NULL, count INTEGER NOT NULL,
             PRIMARY KEY(user_id,event_type));
+        CREATE TABLE IF NOT EXISTS v08_progress (user_id TEXT NOT NULL, achievement_id TEXT NOT NULL, unlocked_at TEXT NOT NULL, PRIMARY KEY(user_id,achievement_id));
         ''')
         for a in ACHIEVEMENTS:
             db.execute('''INSERT INTO achievements(achievement_id,title,description,rank,event_type,target)
@@ -123,24 +119,80 @@ def init_db():
                 title=excluded.title,description=excluded.description,rank=excluded.rank,
                 event_type=excluded.event_type,target=excluded.target''',a)
 
+    V08_STORE.initialize()
+    # Import existing Stage 3 drafts once, preserving their stable IDs.
+    old=BASE/'achievements_v08_preview.db'
+    if old.exists():
+        with sqlite3.connect(str(old)) as source, connect() as dest:
+            try:
+                source.row_factory=sqlite3.Row
+                for row in source.execute('SELECT * FROM v08_achievement_definitions'):
+                    dest.execute("""INSERT OR IGNORE INTO v08_achievement_definitions
+                        (id,title,description,rank,operator,conditions_json,enabled,source,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)""",tuple(row[k] for k in
+                        ('id','title','description','rank','operator','conditions_json','enabled','source','created_at','updated_at')))
+            except sqlite3.OperationalError:
+                pass
 
 def increment(db, uid, event_type, amount=1):
     db.execute('''INSERT INTO event_counters(user_id,event_type,count) VALUES(?,?,?)
         ON CONFLICT(user_id,event_type) DO UPDATE SET count=count+excluded.count''',(uid,event_type,amount))
 
 
-def record_event(user_id, name, event_type, amount=1):
+# Stage 4: custom definitions share the existing runtime database with user/event history.
+V08_STORE = AchievementStore(DB_PATH)
+
+def v08_definitions(enabled_only=False):
+    rows=V08_STORE.list_all()
+    return [r for r in rows if r['enabled']] if enabled_only else rows
+
+def v08_condition_count(db,uid,condition):
+    kind=condition['event_type']
+    if kind=='chat.keyword':
+        kind='chat.keyword:'+unicodedata.normalize('NFKC',condition['keyword']).casefold()
+    row=db.execute('SELECT count FROM event_counters WHERE user_id=? AND event_type=?',(uid,kind)).fetchone()
+    return row[0] if row else 0
+
+def v08_status(db,uid,definition):
+    conditions=definition['conditions']
+    counts=[v08_condition_count(db,uid,c) for c in conditions]
+    targets=[c['target'] for c in conditions]
+    met=[n>=t for n,t in zip(counts,targets)]
+    achieved=all(met) if definition['operator']=='AND' else any(met)
+    # For AND, show the least completed condition; for OR, the most completed one.
+    ratio=(min if definition['operator']=='AND' else max)(min(n/t,1) for n,t in zip(counts,targets))
+    return achieved,round(ratio*100),counts,targets
+
+def v08_record(db,uid,keyword_message=None):
+    if keyword_message is not None:
+        normalized=unicodedata.normalize('NFKC',keyword_message).casefold()
+        keywords={c['keyword'] for d in v08_definitions(True) for c in d['conditions'] if c['event_type']=='chat.keyword'}
+        for word in keywords:
+            if unicodedata.normalize('NFKC',word).casefold() in normalized:
+                increment(db,uid,'chat.keyword:'+unicodedata.normalize('NFKC',word).casefold())
+    unlocked=[]
+    for d in v08_definitions(True):
+        achieved,_,_,_=v08_status(db,uid,d)
+        if not achieved:continue
+        at=datetime.now().astimezone().isoformat(timespec='seconds')
+        cur=db.execute('INSERT OR IGNORE INTO v08_progress(user_id,achievement_id,unlocked_at) VALUES(?,?,?)',(uid,d['id'],at))
+        if cur.rowcount:
+            db.execute('INSERT INTO event_log(user_id,achievement_id,occurred_at) VALUES(?,?,?)',(uid,d['id'],at))
+            unlocked.append(d['title'])
+    return unlocked
+
+def record_event(user_id, name, event_type, amount=1, keyword_message=None):
     user_id = str(user_id).strip()
     name = str(name).strip()
     if not user_id or not name: raise ValueError('ユーザーIDと表示名を入力してください。')
-    if event_type not in {a[4] for a in ACHIEVEMENTS} | set(FIVE_EFFECTS):
+    if event_type not in {a[4] for a in ACHIEVEMENTS} | set(FIVE_EFFECTS) | {'chat.emote','chat.keyword_message','channel_points.used'}:
         raise ValueError('不明なイベント: '+event_type)
     amount = int(amount)
     if not 1 <= amount <= 100: raise ValueError('不正なイベント数')
     unlocked=[]
     with connect() as db:
         db.execute('INSERT INTO users(user_id,display_name) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name',(user_id,name))
-        increment(db,user_id,event_type,amount)
+        if event_type!='chat.keyword_message': increment(db,user_id,event_type,amount)
         if event_type in FIVE_EFFECTS: increment(db,user_id,'effect.five',amount)
         if event_type in ('hacking.giant','hacking.swarm'):
             giant=db.execute('SELECT count FROM event_counters WHERE user_id=? AND event_type=?',(user_id,'hacking.giant')).fetchone()
@@ -161,6 +213,7 @@ def record_event(user_id, name, event_type, amount=1):
             if at:
                 db.execute('INSERT INTO event_log(user_id,achievement_id,occurred_at) VALUES(?,?,?)',(user_id,aid,at))
                 unlocked.append(title)
+        unlocked.extend(v08_record(db,user_id,keyword_message))
     return unlocked
 
 
@@ -192,6 +245,7 @@ def parse_chat_events(message, emote_tags, target_emote_name="shirat43Gg"):
             if target_emote_name and token.casefold()==target_emote_name: gg=True
     if emote_count: events.append(('chat.emote',min(emote_count,100)))
     if gg: events.append('chat.gg')
+    events.append(('chat.keyword_message',message))
     return events
 
 
@@ -206,6 +260,8 @@ BRIDGE_CLIENT_ID = None
 BRIDGE_TOKEN_LOCK = threading.Lock()
 BRIDGE_EVENT_IDS = set()
 BRIDGE_EVENT_LOCK = threading.Lock()
+BRIDGE_ENABLED = False  # Explicitly enabled only by the streamer
+BRIDGE_PROTOCOL_VERSION = 1
 
 class BridgeEmitter(QObject):
     received = pyqtSignal(str, str, str)
@@ -227,9 +283,19 @@ def resolve_twitch_user(login):
         return None
 
 class BridgeHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != '/api/status':
+            self.send_error(404); return
+        if self.headers.get('X-Achievement-Key') != BRIDGE_KEY:
+            self.reply(403, {'error':'unauthorized'}); return
+        self.reply(200, {'app':'AchievementManager', 'protocol_version':BRIDGE_PROTOCOL_VERSION,
+                         'connected':BRIDGE_ENABLED, 'supported_events':sorted(BRIDGE_ALLOWED)})
+
     def do_POST(self):
         if self.path != '/api/event':
             self.send_error(404); return
+        if not BRIDGE_ENABLED:
+            self.reply(503, {'error':'TKG connection is disabled'}); return
         if self.headers.get('X-Achievement-Key') != BRIDGE_KEY:
             self.send_error(403); return
         try:
@@ -347,11 +413,6 @@ def make_default_sound(path):
         f.setnchannels(1);f.setsampwidth(2);f.setframerate(rate)
         f.writeframes(struct.pack('<'+'h'*len(samples),*samples))
 
-class OAuthEvents(QObject):
-    success = pyqtSignal(str, str, str)
-    failure = pyqtSignal(str)
-
-
 class TwitchChatWorker(QObject):
     event_received = pyqtSignal(str, str, object)
     status_changed = pyqtSignal(str)
@@ -431,7 +492,7 @@ class TwitchChatWorker(QObject):
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Achievement Manager v0.7 Beta')
+        self.setWindowTitle('Achievement Manager v0.8 Beta (Stage 7 開発版)')
         self.toasts=[]
         self.toast_queue=[]
         self.toast_busy=False
@@ -444,26 +505,32 @@ class App(QMainWindow):
         self.default_sound=BASE/'default_unlock.wav'
         make_default_sound(self.default_sound)
         self.prefs = QSettings('AchievementManager', 'AchievementManager')
-        self.oauth_events = OAuthEvents()
-        self.oauth_events.success.connect(self.on_oauth_success)
-        self.oauth_events.failure.connect(self.on_oauth_failure)
-        self.oauth_busy = False
         self.resize(1040, 740)
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self.make_dashboard()
         self.make_achievements()
         self.make_profiles()
+        self.make_v08_editor()
         self.make_settings()
         self.twitch_worker = TwitchChatWorker()
         self.twitch_worker.target_emote_name = str(self.prefs.value('gg_emote_name', 'shirat43Gg')).strip()
         self.twitch_worker.event_received.connect(self.on_twitch_event)
         self.twitch_worker.status_changed.connect(self.twitch_status.setText)
-        self.tabs.currentChanged.connect(lambda _: self.refresh_all())
+        self._last_tab_index=self.tabs.currentIndex()
+        self._tab_guard=False
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self.apply_theme()
         self.refresh_all()
         self.start_obs_server()
-        self.start_bridge_server()
+        # TKG bridge stays OFF until the user explicitly enables it.
+
+    def make_v08_editor(self):
+        # Separate database: v0.7 achievements and progress are not modified.
+        self.v08_editor = AchievementEditor(DB_PATH)
+        self.v08_editor.saved.connect(self.refresh_all)
+        self.v08_editor.setWindowTitle('実績管理')
+        self.tabs.addTab(self.v08_editor, '実績管理（v0.8）')
 
     def page(self):
         w = QWidget(); lay = QVBoxLayout(w); lay.setSpacing(14); lay.setContentsMargins(22,22,22,22)
@@ -498,14 +565,32 @@ class App(QMainWindow):
         btn=QPushButton('テストイベントを送信'); btn.clicked.connect(self.test_event)
         g.addRow('TwitchユーザーID（テスト用）',self.test_id)
         g.addRow('表示名',self.test_name); g.addRow('イベント',self.event_select); g.addRow(btn)
+        self.test_chat_text=QLineEdit()
+        self.test_chat_text.setPlaceholderText('例：こんにちは www （チャット受信と同じ判定をテスト）')
+        chat_btn=QPushButton('チャット本文でテスト')
+        chat_btn.clicked.connect(self.test_chat_message)
+        g.addRow('チャット本文',self.test_chat_text)
+        g.addRow(chat_btn)
         l.addWidget(group)
+        self.event_feedback=QLabel('テストイベントの記録待ち')
+        self.event_feedback.setWordWrap(True)
+        l.addWidget(self.event_feedback)
         l.addWidget(QLabel('最近の実績解除'))
         self.recent=self.table(['日時','視聴者','実績']); l.addWidget(self.recent)
         self.tabs.addTab(w,'ダッシュボード')
 
     def make_achievements(self):
-        w,l=self.page(); l.addWidget(QLabel('実績一覧 v0.6（31種類・閲覧のみ）'))
-        self.all_table=self.table(['実績名','難易度','解除条件','必要回数','イベントID'])
+        w,l=self.page(); l.addWidget(QLabel('実績一覧（既存実績 + カスタム実績）'))
+        bar=QHBoxLayout(); bar.addWidget(QLabel('★ ランク順'))
+        self.all_rank_order=QComboBox()
+        self.all_rank_order.addItem('昇順（★1 → ★5）','asc')
+        self.all_rank_order.addItem('降順（★5 → ★1）','desc')
+        self.all_rank_order.currentIndexChanged.connect(self.refresh_all)
+        bar.addWidget(self.all_rank_order); bar.addStretch()
+        l.addLayout(bar)
+        self.all_table=self.table(['実績名','★ ランク','解除条件','必要回数','イベントID'])
+        self.all_table.horizontalHeader().sectionClicked.connect(
+            lambda column: self._toggle_rank_order(self.all_rank_order) if column==1 else None)
         l.addWidget(self.all_table); self.tabs.addTab(w,'実績一覧')
 
     def make_profiles(self):
@@ -518,35 +603,60 @@ class App(QMainWindow):
         self.card_name=QLabel('視聴者を選択してください'); self.card_name.setStyleSheet('font-size:19pt;font-weight:bold;')
         l.addWidget(self.card_name)
         self.card_progress=QProgressBar(); l.addWidget(self.card_progress)
+        rank_bar=QHBoxLayout()
+        rank_bar.addWidget(QLabel('★ ランク順'))
+        self.card_rank_order=QComboBox()
+        self.card_rank_order.addItem('昇順（★1 → ★5）','asc')
+        self.card_rank_order.addItem('降順（★5 → ★1）','desc')
+        self.card_rank_order.currentIndexChanged.connect(self.refresh_card)
+        rank_bar.addWidget(self.card_rank_order)
+        rank_bar.addStretch()
+        l.addLayout(rank_bar)
         self.card_table=self.table(['実績','ランク','状態','進捗','解除日時'])
+        self.card_table.horizontalHeader().sectionClicked.connect(
+            lambda column: self._toggle_rank_order(self.card_rank_order) if column==1 else None)
         l.addWidget(self.card_table)
         self.tabs.addTab(w,'個人実績カード')
+
+    @staticmethod
+    def _toggle_rank_order(combo):
+        combo.setCurrentIndex(1 - combo.currentIndex())
 
     def make_settings(self):
         w,l=self.page()
         group=QGroupBox('接続状況'); f=QFormLayout(group)
         self.twitch_status=QLabel('未接続'); f.addRow('Twitch',self.twitch_status)
-        self.bridge_status=QLabel('起動準備中')
+        self.bridge_status=QLabel('未接続（手動接続）')
         f.addRow('演出アプリ',self.bridge_status)
+        bridge_controls=QHBoxLayout()
+        self.bridge_connect_button=QPushButton('TKG接続')
+        self.bridge_connect_button.clicked.connect(self.start_bridge_server)
+        self.bridge_disconnect_button=QPushButton('TKG切断')
+        self.bridge_disconnect_button.clicked.connect(self.stop_bridge_server)
+        self.bridge_disconnect_button.setEnabled(False)
+        bridge_controls.addWidget(self.bridge_connect_button)
+        bridge_controls.addWidget(self.bridge_disconnect_button)
+        f.addRow(bridge_controls)
+        bridge_help=QLabel('任意連携：TKGは同梱しません。接続時のみローカル127.0.0.1:8767で待機します。\n'
+                           '連携側は既存の /api/event と認証キーに対応する必要があります。')
+        bridge_help.setWordWrap(True)
+        f.addRow(bridge_help)
         f.addRow('OBS通知', QLabel('http://127.0.0.1:8766/'))
         self.twitch_channel=QLineEdit(); self.twitch_channel.setPlaceholderText('配信チャンネル名（英数字）')
         self.twitch_channel.setText(str(self.prefs.value('twitch_channel','')))
+        self.twitch_nick=QLineEdit(); self.twitch_nick.setPlaceholderText('ログインしたTwitchユーザー名')
+        self.twitch_nick.setText(str(self.prefs.value('twitch_nick','')))
+        self.twitch_token=QLineEdit(); self.twitch_token.setEchoMode(QLineEdit.Password)
+        self.twitch_token.setPlaceholderText('チャット読み取り用OAuthアクセストークン（保存しません）')
         f.addRow('配信チャンネル',self.twitch_channel)
-        self.account_label=QLabel('未ログイン')
-        f.addRow('ログイン中のアカウント',self.account_label)
-        self.oauth_button=QPushButton('Twitchでログイン')
-        self.oauth_button.clicked.connect(lambda: self.oauth_login(force_new=True))
-        f.addRow(self.oauth_button)
+        f.addRow('ログイン名',self.twitch_nick)
+        f.addRow('アクセストークン',self.twitch_token)
         buttons=QHBoxLayout()
-        self.reconnect_button=QPushButton('再接続')
-        self.reconnect_button.clicked.connect(self.reconnect_twitch)
+        start=QPushButton('Twitchチャット接続'); start.clicked.connect(self.connect_twitch)
         stop=QPushButton('切断'); stop.clicked.connect(self.disconnect_twitch)
-        buttons.addWidget(self.reconnect_button); buttons.addWidget(stop)
+        buttons.addWidget(start); buttons.addWidget(stop)
         f.addRow(buttons)
-        self.oauth_logout_button=QPushButton('ログアウト（保存した認証情報を削除）')
-        self.oauth_logout_button.clicked.connect(self.oauth_logout)
-        f.addRow(self.oauth_logout_button)
-        f.addRow(QLabel('※ 認証情報はWindows資格情報ストアに保存されます。'))
+        f.addRow(QLabel('※ チャット読み取り権限が必要。トークンは保存しません。'))
         f.addRow(QLabel('※ TKG連携時はこのアプリでTwitchチャットにも接続してください。'))
         l.addWidget(group)
         emote_group=QGroupBox('特定スタンプ実績の設定'); ef=QFormLayout(emote_group)
@@ -724,21 +834,47 @@ class App(QMainWindow):
             self.obs_url.setText('OBS通知サーバー起動失敗: '+str(exc))
 
     def start_bridge_server(self):
-        global BRIDGE_SIGNAL
-        BRIDGE_SIGNAL=self.bridge_emitter
+        global BRIDGE_SIGNAL, BRIDGE_ENABLED
+        if self.bridge_server is not None:
+            return
         try:
-            self.bridge_server=ThreadingHTTPServer(('127.0.0.1',8767),BridgeHandler)
-            threading.Thread(target=self.bridge_server.serve_forever,daemon=True).start()
-            self.bridge_status.setText('イベント受信待機中：127.0.0.1:8767')
+            server=ThreadingHTTPServer(('127.0.0.1',8767),BridgeHandler)
+            BRIDGE_SIGNAL=self.bridge_emitter
+            BRIDGE_ENABLED=True
+            self.bridge_server=server
+            threading.Thread(target=server.serve_forever,daemon=True).start()
+            self.bridge_status.setText('TKG接続：待機中（127.0.0.1:8767）')
+            self.bridge_connect_button.setEnabled(False)
+            self.bridge_disconnect_button.setEnabled(True)
         except OSError as exc:
-            self.bridge_status.setText('起動失敗：'+str(exc))
+            BRIDGE_ENABLED=False
+            BRIDGE_SIGNAL=None
+            self.bridge_status.setText('接続失敗：'+str(exc))
+
+    def stop_bridge_server(self):
+        global BRIDGE_SIGNAL, BRIDGE_ENABLED
+        BRIDGE_ENABLED=False
+        BRIDGE_SIGNAL=None
+        server=self.bridge_server
+        self.bridge_server=None
+        if server:
+            server.shutdown()
+            server.server_close()
+        with BRIDGE_EVENT_LOCK:
+            BRIDGE_EVENT_IDS.clear()
+        self.bridge_status.setText('未接続（手動接続）')
+        self.bridge_connect_button.setEnabled(True)
+        self.bridge_disconnect_button.setEnabled(False)
 
     def on_bridge_event(self,user_id,name,event_type):
         try:
-            unlocked=record_event(user_id,name,event_type[0],event_type[1]) if isinstance(event_type,tuple) else record_event(user_id,name,event_type)
+            if isinstance(event_type,tuple) and event_type[0]=='chat.keyword_message':
+                unlocked=record_event(user_id,name,'chat.keyword_message',keyword_message=event_type[1])
+            else:
+                unlocked=record_event(user_id,name,event_type[0],event_type[1]) if isinstance(event_type,tuple) else record_event(user_id,name,event_type)
             if unlocked: self.queue_unlocks(unlocked,name)
             self.refresh_all()
-            self.bridge_status.setText('イベント受信：'+event_type+' / '+name)
+            self.bridge_status.setText('イベント受信：'+str(event_type)+' / '+name)
         except Exception as exc:
             self.bridge_status.setText('記録エラー：'+str(exc))
 
@@ -746,7 +882,7 @@ class App(QMainWindow):
         with connect() as db:
             for title in titles:
                 row=db.execute('SELECT rank FROM achievements WHERE title=?',(title,)).fetchone()
-                rank=row[0] if row else 1
+                rank=row[0] if row else next((d['rank'] for d in v08_definitions() if d['title']==title),1)
                 self.toast_queue.append((title,name,rank))
         self.next_toast()
 
@@ -773,85 +909,42 @@ class App(QMainWindow):
         self.next_toast()
 
     def closeEvent(self,event):
+        if self.v08_editor.has_unsaved_changes() and not self.v08_editor.confirm_discard():
+            event.ignore(); return
         self.twitch_worker.stop()
         if self.http_server:
             self.http_server.shutdown()
             self.http_server.server_close()
-        if self.bridge_server:
-            self.bridge_server.shutdown()
-            self.bridge_server.server_close()
+        self.stop_bridge_server()
         super().closeEvent(event)
 
-    def oauth_login(self, force_new=False):
-        client_id = public_client_id()
-        if not client_id:
-            QMessageBox.warning(self, '開発者設定が必要',
-                'app_config.json にTwitch Client IDが設定されていません。')
+    def connect_twitch(self):
+        channel=self.twitch_channel.text().strip().lstrip('#').lower()
+        nick=self.twitch_nick.text().strip().lower()
+        token=self.twitch_token.text().strip()
+        if token.lower().startswith('oauth:'): token=token[6:]
+        if not re.fullmatch(r'[a-z0-9_]{3,25}',channel or '') or not re.fullmatch(r'[a-z0-9_]{3,25}',nick or '') or not token:
+            QMessageBox.warning(self,'入力エラー','チャンネル名・ログイン名・アクセストークンを確認してください。')
             return
-        if self.oauth_busy:
-            return
-        self.oauth_busy = True
-        self.oauth_button.setEnabled(False)
-        self.reconnect_button.setEnabled(False)
-        self.twitch_status.setText('Twitch認証中…')
-
-        def worker():
-            try:
-                # 明示的なログインはアカウント切り替えのため常に認可画面を開く。
-                token = None if force_new else twitch_oauth.restore(client_id)
-                if not token:
-                    token = twitch_oauth.login(client_id)
-                identity = twitch_oauth.get_identity(token)
-                if identity.get('client_id') != client_id or 'chat:read' not in identity.get('scopes', []):
-                    raise RuntimeError('Client IDまたはチャット読み取り権限が一致しません。')
-                self.oauth_events.success.emit(identity['login'], token, client_id)
-            except Exception as exc:
-                self.oauth_events.failure.emit(str(exc))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def on_oauth_success(self, nick, token, client_id):
-        self.oauth_busy = False
-        self.oauth_button.setEnabled(True)
-        self.reconnect_button.setEnabled(True)
-        self.account_label.setText(nick)
-        channel = self.twitch_channel.text().strip().lstrip('#').lower() or nick
-        if not re.fullmatch(r'[a-z0-9_]{3,25}', channel):
-            QMessageBox.warning(self, '入力エラー', '配信チャンネル名を確認してください。')
-            return
-        self.twitch_channel.setText(channel)
-        self.prefs.setValue('twitch_channel', channel)
+        self.prefs.setValue('twitch_channel',channel)
+        self.prefs.setValue('twitch_nick',nick)
         global BRIDGE_TOKEN, BRIDGE_CLIENT_ID
         with BRIDGE_TOKEN_LOCK:
-            BRIDGE_TOKEN, BRIDGE_CLIENT_ID = token, client_id
-        self.twitch_worker.start(channel, nick, token)
-
-    def on_oauth_failure(self, message):
-        self.oauth_busy = False
-        self.oauth_button.setEnabled(True)
-        self.reconnect_button.setEnabled(True)
-        self.twitch_status.setText('Twitch認証に失敗しました')
-        QMessageBox.warning(self, 'Twitch認証エラー', message)
-
-    def reconnect_twitch(self):
-        # 資格情報があれば再利用し、期限切れなら更新。なければブラウザ認証。
-        self.oauth_login(force_new=False)
-
-    def oauth_logout(self):
-        if self.oauth_busy:
-            QMessageBox.information(self, '処理中', '認証処理の終了後にログアウトしてください。')
-            return
-        self.disconnect_twitch()
-        client_id = public_client_id()
-        if client_id:
+            BRIDGE_TOKEN=token
+            BRIDGE_CLIENT_ID=None
+        def load_client_id():
+            global BRIDGE_CLIENT_ID
             try:
-                twitch_oauth.clear(client_id)
-            except Exception as exc:
-                QMessageBox.warning(self, 'ログアウトエラー', '保存情報を削除できませんでした：' + str(exc))
-                return
-        self.account_label.setText('未ログイン')
-        QMessageBox.information(self, 'ログアウト',
-            'PCに保存されたTwitch認証情報を削除しました。\n'
-            'Twitch側の連携許可を取り消す場合はTwitchの設定から操作してください。')
+                req=urllib.request.Request('https://id.twitch.tv/oauth2/validate',headers={'Authorization':'OAuth '+token})
+                with urllib.request.urlopen(req,timeout=10) as response:
+                    client_id=json.load(response).get('client_id')
+                with BRIDGE_TOKEN_LOCK:
+                    if BRIDGE_TOKEN==token: BRIDGE_CLIENT_ID=client_id
+            except Exception:
+                pass
+        threading.Thread(target=load_client_id,daemon=True).start()
+        self.twitch_worker.start(channel,nick,token)
+        self.twitch_token.clear()
 
     def disconnect_twitch(self):
         global BRIDGE_TOKEN, BRIDGE_CLIENT_ID
@@ -860,9 +953,25 @@ class App(QMainWindow):
         self.twitch_worker.stop()
         self.twitch_status.setText('未接続')
 
+    def _on_tab_changed(self,index):
+        if self._tab_guard:return
+        if index!=self._last_tab_index and self.tabs.widget(self._last_tab_index) is self.v08_editor:
+            if not self.v08_editor.confirm_discard():
+                self._tab_guard=True
+                self.tabs.setCurrentIndex(self._last_tab_index)
+                self._tab_guard=False
+                return
+            # Leaving the editor discards the unsaved draft.
+            if self.v08_editor.has_unsaved_changes(): self.v08_editor._reset_form()
+        self._last_tab_index=index
+        self.refresh_all()
+
     def on_twitch_event(self,user_id,name,event_type):
         try:
-            unlocked=record_event(user_id,name,event_type[0],event_type[1]) if isinstance(event_type,tuple) else record_event(user_id,name,event_type)
+            if isinstance(event_type,tuple) and event_type[0]=='chat.keyword_message':
+                unlocked=record_event(user_id,name,'chat.keyword_message',keyword_message=event_type[1])
+            else:
+                unlocked=record_event(user_id,name,event_type[0],event_type[1]) if isinstance(event_type,tuple) else record_event(user_id,name,event_type)
             if unlocked: self.queue_unlocks(unlocked,name)
             self.refresh_all()
         except Exception as exc:
@@ -874,23 +983,60 @@ class App(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self,'入力エラー',str(exc)); return
         self.refresh_all()
+        self.event_feedback.setText(
+            ('解除成功：'+'、'.join(unlocked)) if unlocked else 'イベントを記録しました（新しい解除なし）')
         if unlocked:
             self.queue_unlocks(unlocked,self.test_name.text())
         else:
             QMessageBox.information(self,'イベント受信','進捗を記録しました。未解除の新しい実績はありません。')
 
+    def test_chat_message(self):
+        message=self.test_chat_text.text()
+        if not message.strip():
+            QMessageBox.warning(self,'入力エラー','テスト用のチャット本文を入力してください。')
+            return
+        try:
+            unlocked=[]
+            for ev in parse_chat_events(message, '', self.twitch_worker.target_emote_name):
+                if isinstance(ev,tuple) and ev[0]=='chat.keyword_message':
+                    unlocked.extend(record_event(self.test_id.text(),self.test_name.text(),
+                        'chat.keyword_message',keyword_message=ev[1]))
+                elif isinstance(ev,tuple):
+                    unlocked.extend(record_event(self.test_id.text(),self.test_name.text(),ev[0],ev[1]))
+                else:
+                    unlocked.extend(record_event(self.test_id.text(),self.test_name.text(),ev))
+        except (ValueError,sqlite3.Error) as exc:
+            QMessageBox.warning(self,'テストエラー',str(exc))
+            return
+        self.refresh_all()
+        self.event_feedback.setText('チャット解析テスト：'+
+            ('解除 '+ '、'.join(unlocked) if unlocked else '記録成功・新しい解除なし'))
+        if unlocked:self.queue_unlocks(unlocked,self.test_name.text())
+
     def refresh_all(self):
         with connect() as db:
             users=db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
             unlocks=db.execute("SELECT COUNT(*) FROM progress WHERE unlocked_at IS NOT NULL AND achievement_id LIKE 'v06_%'").fetchone()[0]
+            unlocks+=db.execute('SELECT COUNT(*) FROM v08_progress').fetchone()[0]
             self.stats.setText(f'登録視聴者  {users} 人      累計実績解除  {unlocks} 件')
-            rows=db.execute('''SELECT e.occurred_at,u.display_name,a.title FROM event_log e
-                JOIN users u ON e.user_id=u.user_id JOIN achievements a ON e.achievement_id=a.achievement_id
-                WHERE a.achievement_id LIKE 'v06_%'
+            rows=db.execute('''SELECT e.occurred_at,u.display_name,
+                    COALESCE(a.title,d.title,'（削除済み実績）')
+                FROM event_log e
+                JOIN users u ON e.user_id=u.user_id
+                LEFT JOIN achievements a ON e.achievement_id=a.achievement_id
+                LEFT JOIN v08_achievement_definitions d ON e.achievement_id=d.id
                 ORDER BY e.id DESC LIMIT 50''').fetchall()
             self.fill(self.recent,rows)
             rows=db.execute("SELECT title,rank,description,target,event_type FROM achievements WHERE achievement_id LIKE 'v06_%' ORDER BY rank,achievement_id").fetchall()
-            self.fill(self.all_table,[(a,'★'*b+'☆'*(5-b),c,d,e) for a,b,c,d,e in rows])
+            displayed=[(a,'★'*b+'☆'*(5-b),c,d,e) for a,b,c,d,e in rows]
+            for d in v08_definitions():
+                if not d['enabled']:continue
+                conditions=d['conditions']
+                summary=('  '+d['operator']+'  ').join(c['event_type']+((' : '+c['keyword']) if 'keyword' in c else '') for c in conditions)
+                displayed.append((d['title'],'★'*d['rank']+'☆'*(5-d['rank']),summary,
+                    ' / '.join(str(c['target']) for c in conditions), 'カスタム'))
+            displayed=sort_achievements(displayed, self.all_rank_order.currentData(), rank_index=1)
+            self.fill(self.all_table,displayed)
         self.refresh_profiles()
 
     def refresh_profiles(self):
@@ -917,10 +1063,18 @@ class App(QMainWindow):
                 FROM achievements a LEFT JOIN progress p ON p.achievement_id=a.achievement_id AND p.user_id=?
                 WHERE a.achievement_id LIKE 'v06_%'
                 ORDER BY a.rank,a.title''',(uid,)).fetchall()
-        done=sum(bool(x[4]) for x in rows); total=len(rows)
+            custom=[]
+            for d in v08_definitions(True):
+                achieved,percent,counts,targets=v08_status(db,uid,d)
+                at=db.execute('SELECT unlocked_at FROM v08_progress WHERE user_id=? AND achievement_id=?',(uid,d['id'])).fetchone()
+                custom.append((d['title'],d['rank'],bool(at),f'{percent}% ({" / ".join(str(min(n,t))+"/"+str(t) for n,t in zip(counts,targets))})',at[0] if at else None))
+        done=sum(bool(x[4]) for x in rows)+sum(x[2] for x in custom); total=len(rows)+len(custom)
         self.card_name.setText(f'🏆 {name}   —   {done} / {total} 解除')
         self.card_progress.setValue(round(done*100/total) if total else 0)
-        self.fill(self.card_table,[(title,'★'*rank+'☆'*(5-rank),'解除済み' if at else '未解除',f'{min(count,target)} / {target}',at or '-') for title,rank,count,target,at in rows])
+        card_rows=[(title,'★'*rank+'☆'*(5-rank),'解除済み' if at else '未解除',f'{min(count,target)} / {target}',at or '-') for title,rank,count,target,at in rows]
+        card_rows.extend((title,'★'*rank+'☆'*(5-rank),'解除済み' if done else '未解除',progress,at or '-') for title,rank,done,progress,at in custom)
+        card_rows=sort_achievements(card_rows, self.card_rank_order.currentData(), rank_index=1)
+        self.fill(self.card_table,card_rows)
 
     def backup(self):
         dst=BASE / ('achievements_backup_'+datetime.now().strftime('%Y%m%d_%H%M%S')+'.db')
@@ -939,9 +1093,7 @@ class App(QMainWindow):
             self.http_server.shutdown()
             self.http_server.server_close()
             self.http_server=None
-        self.bridge_server=None
-        self.bridge_emitter=BridgeEmitter()
-        self.bridge_emitter.received.connect(self.on_bridge_event)
+        self.stop_bridge_server()
         import subprocess
         try:
             if getattr(sys,'frozen',False):
